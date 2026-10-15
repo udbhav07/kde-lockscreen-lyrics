@@ -23,7 +23,20 @@ Rectangle {
     property bool lyricsShown: true
     signal lyricsButtonClicked()
 
-    readonly property var player: mpris.currentPlayer
+    // Prefer Spotify (the helpers only follow Spotify). KDE's own choice can
+    // be another app, e.g. a stopped browser tab with no title, which would
+    // hide the controller and the lyrics.
+    readonly property var spotifyPlayer: {
+        players.count;      // re-check when players appear or disappear
+        for (let i = 0; i < players.count; i++) {
+            const p = players.objectAt(i);
+            if (p && p.isSpotify) {
+                return p.container;
+            }
+        }
+        return null;
+    }
+    readonly property var player: spotifyPlayer ?? mpris.currentPlayer
     readonly property bool hasMedia: player !== null && player.track.length > 0
     readonly property bool playing: player !== null && player.playbackStatus === Mpris.PlaybackStatus.Playing
     readonly property bool hasLyrics: files !== null && files.lyricsText.length > 0
@@ -52,6 +65,19 @@ Rectangle {
 
     Mpris.Mpris2Model {
         id: mpris
+    }
+
+    // One small object per media player, to find Spotify among them
+    Instantiator {
+        id: players
+        model: mpris
+        delegate: QtObject {
+            required property var model
+            readonly property var container: model.container
+            readonly property bool isSpotify: !model.isMultiplexer
+                && ((model.desktopEntry || "").toLowerCase().includes("spotify")
+                    || (model.identity || "").toLowerCase() === "spotify")
+        }
     }
 
     onPlayerChanged: positionMs = player ? player.position / 1000 : 0
