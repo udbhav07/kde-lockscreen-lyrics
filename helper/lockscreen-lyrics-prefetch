@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""
+Pre-downloads synced lyrics and covers for the songs around the one Spotify
+is playing, so the lock screen has them instantly: the next song first, then
+the previous one, then +2, -2 ... up to 25 each way.
+
+Songs are saved as ~/.cache/kde-lockscreen-lyrics/songs/<spotify-track-id>.lrc
+and .jpg, the same files lockscreen-media-helper uses. At most 500 songs are
+kept; the least recently used ones are deleted first.
+
+Setup (once):
+  1. Create an app at https://developer.spotify.com/dashboard with the
+     redirect URI http://127.0.0.1:8888/callback (Web API).
+  2. Save its Client ID:  echo YOUR_CLIENT_ID > ~/.config/kde-lockscreen-lyrics/spotify-client-id
+  3. Log in:              lockscreen-lyrics-prefetch --login
+"""
+
+import base64
+import hashlib
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
+import os
+import re
+import secrets
+import select
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+SONGS = Path.home() / ".cache/kde-lockscreen-lyrics/songs"
+CONFIG = Path.home() / ".config/kde-lockscreen-lyrics"
+CLIENT_ID_FILE = CONFIG / "spotify-client-id"
+TOKEN_FILE = CONFIG / "spotify-token.json"
+
+REDIRECT_URI = "http://127.0.0.1:8888/callback"
+SCOPES = ("user-read-playback-state user-read-currently-playing user-read-recently-played "
+          "playlist-read-private playlist-read-collaborative user-library-read")
+UA = "kde-lockscreen-lyrics/0.1 (https://github.com/udbhav07/kde-lockscreen-lyrics)"
+
+AROUND = 25                     # songs before and after the current one
+MAX_SONGS = 500                 # cache limit
+LRCLIB_PAUSE = 5                # seconds between LRCLIB requests
+LRCLIB_BACKOFF = (15, 30, 60)   # waits after "429 Too Many Requests"
+MAX_PAGES = 40                  # don't read more than this many pages of a playlist
+
+
+def log(*args):
+    print(*args, flush=True)
+
+
+# ---------------------------------------------------------------- HTTP
+
+class HttpError(Exception):
+    def __init__(self, status, retry_after=None):
+        super().__init__(f"HTTP {status}" if status else "network error")
+        self.status = status
+        self.retry_after = retry_after
+
+
+def http(url, data=None, headers=None):
+    """Returns (status, body). Raises HttpError on 4xx/5xx or network failure."""
+    request = urllib.request.Request(url, data=data, headers={"User-Agent": UA, **(headers or {})})
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as e:
+        raise HttpError(e.code, e.headers.get("Retry-After")) from None
+    except OSError:
+        raise HttpError(0) from None
+
+
+# ---------------------------------------------------------------- Spotify login
+
+def client_id():
+    try:
+        return CLIENT_ID_FILE.read_text().strip()
+    except FileNotFoundError:
+        sys.exit(f"Save your Spotify app's Client ID in {CLIENT_ID_FILE} first.")
+
+
+def save_token(token):
+    token["expires_at"] = time.time() + token.get("expires_in", 3600) - 60
+    CONFIG.mkdir(parents=True, exist_ok=True)
+    tmp = TOKEN_FILE.with_suffix(".tmp")
+    # 0o600: only you can read the file, it works like a password
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump(token, f)
+    tmp.replace(TOKEN_FILE)
+
+
+def token_request(fields):
+    _, body = http("https://accounts.spotify.com/api/token",
+                   data=urllib.parse.urlencode(fields).encode(),
+                   headers={"Content-Type": "application/x-www-form-urlencoded"})
+    return json.loads(body)
+
+
+def access_token():
+    token = json.loads(TOKEN_FILE.read_text())
+    if time.time() > token["expires_at"]:
+        new = token_request({"grant_type": "refresh_token",
+                             "refresh_token": token["refresh_token"],
+                             "client_id": client_id()})
+        new.setdefault("refresh_token", token["refresh_token"])
+        save_token(new)
+        token = new
+    return token["access_token"]
+
+
+def login():
+    """PKCE login: opens the browser, catches Spotify's answer on 127.0.0.1:8888."""
+    cid = client_id()
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(16)
+    url = "https://accounts.spotify.com/authorize?" + urllib.parse.urlencode({
+        "client_id": cid, "response_type": "code", "redirect_uri": REDIRECT_URI,
+        "scope": SCOPES, "state": state,
+        "code_challenge_method": "S256", "code_challenge": challenge,
+    })
+
+    answer = {}
+
+    class Callback(BaseHTTPRequestHandler):
+        def do_GET(self):
+            parts = urllib.parse.urlparse(self.path)
+            if parts.path != "/callback":
+                self.send_error(404)
+                return
+            answer.update({k: v[0] for k, v in urllib.parse.parse_qs(parts.query).items()})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"kde-lockscreen-lyrics: done, you can close this tab.")
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 8888), Callback)
+    log("Opening your browser. If nothing opens, visit this address:\n" + url)
+    subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    while "code" not in answer and "error" not in answer:
+        server.handle_request()
+    server.server_close()
+
+    if answer.get("state") != state or "code" not in answer:
+        sys.exit("Login failed: " + answer.get("error", "unexpected answer"))
+    save_token(token_request({"grant_type": "authorization_code", "code": answer["code"],
+                              "redirect_uri": REDIRECT_URI, "client_id": cid,
+                              "code_verifier": verifier}))
+    log(f"Logged in. Token saved in {TOKEN_FILE}")
+
+
+# ---------------------------------------------------------------- Spotify Web API
+
+def spotify(path, params=None):
+    url = path if path.startswith("https://") else "https://api.spotify.com/v1" + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    for attempt in range(3):
+        try:
+            status, body = http(url, headers={"Authorization": "Bearer " + access_token()})
+            return json.loads(body) if status != 204 and body else None
+        except HttpError as e:
+            if e.status == 429 and attempt < 2:
+                time.sleep(int(e.retry_after or 5))
+                continue
+            raise
+
+
+def track_info(t):
+    """The parts of a Spotify track we need, or None for ads/podcasts."""
+    if not t or t.get("type", "track") != "track" or not t.get("id"):
+        return None
+    images = (t.get("album") or {}).get("images") or []
+    return {
+        "id": t["id"],
+        "title": t["name"],
+        "artist": t["artists"][0]["name"] if t.get("artists") else "",
+        "cover": images[0]["url"] if images else "",
+    }
+
+
+def context_tracks(context, current_id):
+    """Tracks of the playlist / album / Liked Songs being played, in order.
+    Stops reading pages once AROUND songs after the current one are known."""
+    kind, cid = context["type"], context["uri"].split(":")[-1]
+    if kind == "playlist":
+        # Spotify renamed /tracks to /items; new apps get 403 on the old name
+        try:
+            page = spotify(f"/playlists/{cid}/items", {"limit": 100})
+        except HttpError as e:
+            if e.status not in (403, 404):
+                raise
+            page = spotify(f"/playlists/{cid}/tracks", {"limit": 100})
+        pick = lambda item: item.get("track") or item.get("item")
+    elif kind == "album":
+        album = spotify(f"/albums/{cid}")
+        page = album["tracks"]
+        pick = lambda item: {**item, "album": {"images": album.get("images", [])}}
+    elif kind == "collection":
+        page = spotify("/me/tracks", {"limit": 50})
+        pick = lambda item: item.get("track")
+    else:
+        return []
+
+    tracks, found_at = [], None
+    for _ in range(MAX_PAGES):
+        for item in page.get("items", []):
+            info = track_info(pick(item))
+            if info:
+                if info["id"] == current_id and found_at is None:
+                    found_at = len(tracks)
+                tracks.append(info)
+        if found_at is not None and len(tracks) > found_at + AROUND or not page.get("next"):
+            break
+        page = spotify(page["next"])
+    return tracks
+
+
+def queue_window(current):
+    """For shuffle, radio and mixes: Spotify's real queue + recently played."""
+    queue = spotify("/me/player/queue") or {}
+    upcoming = [t for t in map(track_info, queue.get("queue", [])) if t]
+    recent = spotify("/me/player/recently-played", {"limit": 50}) or {}
+    # Recently played can include the current song and repeats; drop those
+    previous, seen = [], {current["id"]}
+    for t in (track_info(i.get("track")) for i in recent.get("items", [])):
+        if t and t["id"] not in seen:
+            seen.add(t["id"])
+            previous.append(t)
+    order = [current]
+    for i in range(AROUND):
+        order += [lst[i] for lst in (upcoming, previous) if i < len(lst)]
+    return order
+
+
+def window():
+    """[current, +1, -1, +2, -2, ...] without duplicates."""
+    state = spotify("/me/player")
+    current = track_info((state or {}).get("item"))
+    if not current:
+        return []
+    order = None
+    if state.get("context") and not state.get("shuffle_state"):
+        tracks = context_tracks(state["context"], current["id"])
+        ids = [t["id"] for t in tracks]
+        if current["id"] in ids:
+            i = ids.index(current["id"])
+            order = [tracks[i]]
+            for d in range(1, AROUND + 1):
+                order += [tracks[j] for j in (i + d, i - d) if 0 <= j < len(tracks)]
+    if order is None:
+        order = queue_window(current)
+    seen, result = set(), []
+    for t in order:
+        if t["id"] not in seen:
+            seen.add(t["id"])
+            result.append(t)
+    return result
+
+
+# ---------------------------------------------------------------- lyrics + cache
+
+class SongChanged(Exception):
+    def __init__(self, track_id):
+        self.track_id = track_id
+
+
+def clean_title(title):
+    """Same cleanup as the helper: drop "(From ...)", "(feat. ...)", " - ..."."""
+    title = re.sub(r" *[(\[](from|feat\.|ft\.)[^\])]*[\])]", "", title, count=1, flags=re.I)
+    return re.sub(r" - .*$", "", title)
+
+
+def lrclib_lyrics(track, wait):
+    """LRC text ("" if the song has no synced lyrics), or None if LRCLIB never answered."""
+    url = "https://lrclib.net/api/search?" + urllib.parse.urlencode(
+        {"artist_name": track["artist"], "track_name": clean_title(track["title"])})
+    for pause in (*LRCLIB_BACKOFF, None):
+        try:
+            _, body = http(url)
+            results = json.loads(body)
+            return next((r["syncedLyrics"] for r in results if r.get("syncedLyrics")), "")
+        except HttpError as e:
+            if pause is None:
+                return None
+            log(f"    LRCLIB {e}, retrying in {pause}s")
+            wait(pause)
+
+
+def write_atomic(path, data):
+    tmp = path.with_name(".tmp." + path.name)
+    tmp.write_bytes(data)
+    tmp.replace(path)
+
+
+def evict(keep):
+    """Delete the least recently used songs while there are more than MAX_SONGS."""
+    songs = {}
+    for f in SONGS.iterdir():
+        if not f.name.startswith("."):
+            songs.setdefault(f.stem, []).append(f)
+    extra = len(songs) - MAX_SONGS
+    if extra <= 0:
+        return
+
+    def last_used(stem):
+        return max((f.stat().st_mtime for f in songs[stem] if f.exists()), default=0)
+
+    oldest = sorted((s for s in songs if s not in keep), key=last_used)[:extra]
+    for stem in oldest:
+        for f in songs[stem]:
+            f.unlink(missing_ok=True)
+    log(f"  cache over {MAX_SONGS} songs: deleted {len(oldest)} least recently used")
+
+
+def prefetch(order, wait):
+    keep = {t["id"] for t in order}
+    # Mark everything around the current song as recently used first
+    for t in order:
+        for f in (SONGS / f"{t['id']}.lrc", SONGS / f"{t['id']}.jpg"):
+            if f.exists():
+                f.touch()
+
+    # Covers come from Spotify's image server, which has no rate limit
+    for t in order[1:]:
+        cover = SONGS / f"{t['id']}.jpg"
+        if t["cover"] and not cover.exists():
+            try:
+                write_atomic(cover, http(t["cover"])[1])
+            except HttpError:
+                pass
+
+    missing = [t for t in order[1:] if not (SONGS / f"{t['id']}.lrc").exists()]
+    log(f"  {len(order) - 1} songs around it, {len(order) - 1 - len(missing)} already saved, "
+        f"{len(missing)} to download")
+
+    for n, t in enumerate(missing, 1):
+        wait(LRCLIB_PAUSE)              # be gentle with LRCLIB
+        text = lrclib_lyrics(t, wait)
+        name = f"{t['artist']} - {t['title']}"
+        if text is None:
+            log(f"  [{n}/{len(missing)}] {name}: LRCLIB not answering, will retry next time")
+            continue
+        write_atomic(SONGS / f"{t['id']}.lrc", (text + "\n").encode() if text else b"")
+        log(f"  [{n}/{len(missing)}] {name}: {text.count(chr(10)) + 1 if text else 0} lines")
+        evict(keep)
+    evict(keep)
+
+
+# ---------------------------------------------------------------- song changes
+
+class Lines:
+    """Reads playerctl's output line by line, with a timeout."""
+
+    def __init__(self, fd):
+        self.fd, self.buffer = fd, b""
+
+    def get(self, timeout):
+        """Next line, or None after `timeout` seconds (None = wait forever)."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while b"\n" not in self.buffer:
+            left = None if deadline is None else deadline - time.monotonic()
+            if left is not None and left <= 0:
+                return None
+            if not select.select([self.fd], [], [], left)[0]:
+                return None
+            chunk = os.read(self.fd, 4096)
+            if not chunk:
+                sys.exit("playerctl stopped")   # systemd restarts us
+            self.buffer += chunk
+        line, self.buffer = self.buffer.split(b"\n", 1)
+        return line.decode().strip()
+
+
+def track_id(line):
+    """"/com/spotify/track/0FIDCNYYjNvPVimz5icugS" -> "0FIDCNYYjNvPVimz5icugS"."""
+    if "track" not in line:
+        return None     # ads, or Spotify closed
+    return re.split(r"[/:]", line)[-1] or None
+
+
+def main():
+    if "--login" in sys.argv:
+        login()
+        return
+    if not TOKEN_FILE.exists():
+        sys.exit("Not logged in yet. Run: lockscreen-lyrics-prefetch --login")
+    SONGS.mkdir(parents=True, exist_ok=True)
+
+    player = subprocess.Popen(["playerctl", "-p", "spotify", "--follow", "metadata",
+                               "--format", "{{mpris:trackid}}"], stdout=subprocess.PIPE)
+    lines = Lines(player.stdout.fileno())
+    current, upcoming = None, None
+
+    while True:
+        if upcoming is None:
+            upcoming = track_id(lines.get(None))
+            if upcoming is None or upcoming == current:
+                upcoming = None
+                continue
+        current, upcoming = upcoming, None
+
+        def wait(seconds):
+            """Sleeps, but raises SongChanged as soon as another song starts."""
+            end = None if seconds is None else time.monotonic() + seconds
+            while True:
+                left = None if end is None else end - time.monotonic()
+                if left is not None and left <= 0:
+                    return
+                line = lines.get(left)
+                if line is None:
+                    return
+                tid = track_id(line)
+                if tid and tid != current:
+                    raise SongChanged(tid)
+
+        try:
+            try:
+                wait(2)     # give Spotify's Web API a moment to see the new song
+                order = window()
+                if order:
+                    log(f"Now playing: {order[0]['artist']} - {order[0]['title']}")
+                    prefetch(order, wait)
+                    log("  done")
+            except (HttpError, OSError, ValueError, KeyError) as e:
+                log(f"  stopped: {e}")
+            wait(None)      # nothing left to do until the song changes
+        except SongChanged as e:
+            upcoming = e.track_id
+
+
+if __name__ == "__main__":
+    main()

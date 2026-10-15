@@ -1,0 +1,14 @@
+[Unit]
+Description=Pre-downloads lyrics for the songs around the one Spotify is playing
+PartOf=graphical-session.target
+After=graphical-session.target
+# Starts only after: lockscreen-lyrics-prefetch --login
+ConditionPathExists=%h/.config/kde-lockscreen-lyrics/spotify-token.json
+
+[Service]
+ExecStart=%h/.local/bin/lockscreen-lyrics-prefetch
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target

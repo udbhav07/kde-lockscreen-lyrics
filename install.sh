@@ -17,6 +17,13 @@ systemctl --user daemon-reload
 systemctl --user enable lockscreen-media-helper
 systemctl --user restart lockscreen-media-helper
 
+echo "Installing lyrics prefetcher..."
+install -Dm755 helper/lockscreen-lyrics-prefetch "$HOME/.local/bin/lockscreen-lyrics-prefetch"
+install -Dm644 systemd/lockscreen-lyrics-prefetch.service "$HOME/.config/systemd/user/lockscreen-lyrics-prefetch.service"
+systemctl --user daemon-reload
+systemctl --user enable lockscreen-lyrics-prefetch
+# Does nothing until you've run: lockscreen-lyrics-prefetch --login
+systemctl --user restart lockscreen-lyrics-prefetch
 
 echo "Done. Test it with: /usr/libexec/kscreenlocker_greet --testing"
 
