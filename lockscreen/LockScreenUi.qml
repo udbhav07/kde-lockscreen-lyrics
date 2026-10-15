@@ -267,14 +267,21 @@ Item {
             id: clock
             property Item shadow: clockShadow
             visible: y > 0 && config.alwaysShowClock
-            anchors.horizontalCenter: mainStack.horizontalCenter
+            // Idle screen: centred in the left half. Password screen: centred
+            // above the password column, as before.
+            x: lockScreenRoot.uiVisible
+                ? mainStack.x + mainStack.width / 2 - width / 2
+                : parent.width / 4 - width / 2
+            Behavior on x { NumberAnimation { duration: Kirigami.Units.longDuration; easing.type: Easing.OutCubic } }
             y: (mainBlock.userList.y + mainStack.y)/2 - height/2
             spacing: 0
 
             PlasmaComponents3.Label {
                 text: Qt.formatTime(clockSource.dateTime, Qt.locale(), Locale.ShortFormat)
                 textFormat: Text.PlainText
-                font.pointSize: Math.round(Kirigami.Theme.defaultFont.pointSize * 3.6)
+                // Bigger on the idle screen, normal size above the password box
+                font.pointSize: Kirigami.Theme.defaultFont.pointSize * (lockScreenRoot.uiVisible ? 3.6 : 6)
+                Behavior on font.pointSize { NumberAnimation { duration: Kirigami.Units.longDuration } }
                 font.weight: Font.DemiBold
                 renderType: Text.NativeRendering
                 Layout.alignment: Qt.AlignHCenter
@@ -282,7 +289,8 @@ Item {
             PlasmaComponents3.Label {
                 text: Qt.formatDate(clockSource.dateTime, Qt.locale(), Locale.LongFormat)
                 textFormat: Text.PlainText
-                font.pointSize: Math.round(Kirigami.Theme.defaultFont.pointSize * 1.3)
+                font.pointSize: Kirigami.Theme.defaultFont.pointSize * (lockScreenRoot.uiVisible ? 1.3 : 1.8)
+                Behavior on font.pointSize { NumberAnimation { duration: Kirigami.Units.longDuration } }
                 renderType: Text.NativeRendering
                 Layout.alignment: Qt.AlignHCenter
             }
@@ -296,13 +304,17 @@ Item {
             id: mediaFiles
         }
 
-        // Big media controller, shown on the idle screen only
+        // Big media controller, shown on the idle screen only. It sits at the
+        // middle of the screen, and moves to the bottom to make room for lyrics.
         NowPlaying {
             id: nowPlaying
-            anchors.left: parent.left
-            anchors.leftMargin: Kirigami.Units.gridUnit * 3
-            anchors.bottom: parent.bottom
-            anchors.bottomMargin: Kirigami.Units.gridUnit * 3
+            readonly property bool lyricsOnScreen: lyricsShown && mediaFiles.lyricsText.length > 0
+            // Centred in the left half, like the clock
+            x: Math.max(Kirigami.Units.gridUnit * 3, parent.width / 4 - width / 2)
+            y: lyricsOnScreen
+                ? parent.height - height - Kirigami.Units.gridUnit * 3
+                : parent.height * 0.52 - height / 2
+            Behavior on y { NumberAnimation { duration: 500; easing.type: Easing.OutCubic } }
             files: mediaFiles
             shown: !lockScreenRoot.uiVisible
             onLyricsButtonClicked: lyricsShown = !lyricsShown
@@ -314,9 +326,10 @@ Item {
             anchors.leftMargin: Kirigami.Units.gridUnit * 3
             anchors.top: clock.bottom
             anchors.topMargin: Kirigami.Units.gridUnit * 2
-            anchors.bottom: nowPlaying.top
-            anchors.bottomMargin: Kirigami.Units.gridUnit * 2
-            width: Math.min(parent.width * 0.45, Kirigami.Units.gridUnit * 34)
+            // Ends where the controller's bottom position starts
+            anchors.bottom: parent.bottom
+            anchors.bottomMargin: nowPlaying.height + Kirigami.Units.gridUnit * 5
+            width: Math.min(parent.width * 0.5, Kirigami.Units.gridUnit * 44)
             lyricsText: mediaFiles.lyricsText
             positionMs: nowPlaying.positionMs
             shown: nowPlaying.visible && nowPlaying.lyricsShown && !lockScreenRoot.uiVisible
