@@ -18,6 +18,7 @@ import org.kde.kscreenlocker as ScreenLocker
 
 import org.kde.plasma.private.sessions
 import org.kde.breeze.components
+import org.kde.plasma.clock as PlasmaClock
 
 Item {
     id: lockScreenUi
@@ -118,57 +119,76 @@ Item {
         hoverEnabled: true
         cursorShape: uiVisible ? Qt.ArrowCursor : Qt.BlankCursor
         drag.filterChildren: true
-        onPressed: uiVisible = true;
+        onPressed: {
+            uiVisible = true;
+            fadeoutTimer.restart();
+        }
         onPositionChanged: {
             uiVisible = seenPositionChange;
             seenPositionChange = true;
+            if (uiVisible) {
+                fadeoutTimer.restart();
+            }
         }
         onUiVisibleChanged: {
             if (uiVisible) {
                 Window.window.requestActivate();
             }
 
-            if (blockUI) {
-                fadeoutTimer.running = false;
-            } else if (uiVisible) {
+            if (uiVisible) {
                 fadeoutTimer.restart();
             }
             authenticator.startAuthenticating();
         }
         onBlockUIChanged: {
             if (blockUI) {
-                fadeoutTimer.running = false;
                 uiVisible = true;
-            } else {
-                fadeoutTimer.restart();
             }
+            fadeoutTimer.restart();
         }
         onExited: {
             uiVisible = false;
         }
-        Keys.onEscapePressed: {
-            // If the escape key is pressed, kscreenlocker will turn off the screen.
-            // We do not want to show the password prompt in this case.
-            if (uiVisible) {
-                uiVisible = false;
-                if (inputPanel.keyboardActive) {
-                    inputPanel.showHide();
-                }
-                root.clearPassword();
+        // Clear any typed password and return to the idle lock screen.
+        function backToIdle() {
+            fadeoutTimer.running = false;
+            mainBlock.mainPasswordBox.showPassword = false;
+            if (inputPanel.keyboardActive) {
+                inputPanel.showHide();
             }
+            root.clearPassword();
+            uiVisible = false;
         }
+        // Esc works even while the password field has keyboard focus.
+        // F20: InputActions remaps Esc to F20 on the lock screen, because
+        // kscreenlocker turns the display off whenever Esc is released.
+        Shortcut {
+            sequences: ["Escape", "F20"]
+            enabled: lockScreenRoot.uiVisible
+            onActivated: lockScreenRoot.backToIdle()
+        }
+        // Esc while the prompt is hidden (kscreenlocker turns the screen off):
+        // keep the prompt hidden.
+        Keys.onEscapePressed: backToIdle()
         Keys.onPressed: event => {
+            // Remapped Esc while the prompt is already hidden: stay hidden
+            if (event.key === Qt.Key_F20) {
+                event.accepted = true;
+                return;
+            }
             uiVisible = true;
+            fadeoutTimer.restart();
             event.accepted = false;
         }
         Timer {
             id: fadeoutTimer
             interval: 10000
             onTriggered: {
-                if (!lockScreenRoot.blockUI) {
-                    mainBlock.mainPasswordBox.showPassword = false;
-                    lockScreenRoot.uiVisible = false;
+                // Leave the user-switching screen alone
+                if (mainStack.depth > 1) {
+                    return;
                 }
+                lockScreenRoot.backToIdle();
             }
         }
         Timer {
@@ -197,6 +217,16 @@ Item {
         Component.onCompleted: launchAnimation.start();
 
         WallpaperFader {
+            id: wallpaperFader
+            // Lighter blur behind the password box (Breeze default: 50)
+            readonly property real blurStrength: 25
+            Component.onCompleted: {
+                for (const child of children) {
+                    if (child.radius !== undefined && child.source !== undefined) {
+                        child.radius = Qt.binding(() => blurStrength * wallpaperFader.factor);
+                    }
+                }
+            }
             anchors.fill: parent
             state: lockScreenRoot.uiVisible ? "on" : "off"
             source: wallpaper
@@ -225,13 +255,34 @@ Item {
             }
         }
 
-        Clock {
+        // Compact clock (replaces the large Breeze clock), above the left column
+        ColumnLayout {
             id: clock
             property Item shadow: clockShadow
             visible: y > 0 && config.alwaysShowClock
-            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.horizontalCenter: mainStack.horizontalCenter
             y: (mainBlock.userList.y + mainStack.y)/2 - height/2
-            Layout.alignment: Qt.AlignBaseline
+            spacing: 0
+
+            PlasmaComponents3.Label {
+                text: Qt.formatTime(clockSource.dateTime, Qt.locale(), Locale.ShortFormat)
+                textFormat: Text.PlainText
+                font.pointSize: Math.round(Kirigami.Theme.defaultFont.pointSize * 3.6)
+                font.weight: Font.DemiBold
+                renderType: Text.NativeRendering
+                Layout.alignment: Qt.AlignHCenter
+            }
+            PlasmaComponents3.Label {
+                text: Qt.formatDate(clockSource.dateTime, Qt.locale(), Locale.LongFormat)
+                textFormat: Text.PlainText
+                font.pointSize: Math.round(Kirigami.Theme.defaultFont.pointSize * 1.3)
+                renderType: Text.NativeRendering
+                Layout.alignment: Qt.AlignHCenter
+            }
+            PlasmaClock.Clock {
+                id: clockSource
+                trackSeconds: false
+            }
         }
 
         ListModel {
@@ -252,8 +303,9 @@ Item {
             id: mainStack
             anchors {
                 left: parent.left
-                right: parent.right
+                leftMargin: Kirigami.Units.gridUnit * 3
             }
+            width: Math.min(Kirigami.Units.gridUnit * 20, lockScreenRoot.width - Kirigami.Units.gridUnit * 6)
             height: lockScreenRoot.height + Kirigami.Units.gridUnit * 3
             focus: true //StackView is an implicit focus scope, so we need to give this focus so the item inside will have it
 
