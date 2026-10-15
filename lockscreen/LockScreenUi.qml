@@ -117,9 +117,14 @@ Item {
         width: parent.width
         height: parent.height
         hoverEnabled: true
-        cursorShape:  Qt.ArrowCursor 
+        cursorShape: Qt.ArrowCursor
         drag.filterChildren: true
-        onPressed: {
+        onPressed: mouse => {
+            // Clicks on the media controller don't open the password screen
+            if (nowPlaying.visible && nowPlaying.contains(mapToItem(nowPlaying, mouse.x, mouse.y))) {
+                mouse.accepted = false;
+                return;
+            }
             uiVisible = true;
             fadeoutTimer.restart();
         }
@@ -286,14 +291,37 @@ Item {
                 trackSeconds: false
             }
         }
-        ReadTest {
-            anchors.left: parent.left
-            anchors.top: parent.top
-            anchors.margins: 40
-            opacity: lockScreenRoot.uiVisible ? 0 : 1
-            visible: opacity > 0
-            Behavior on opacity { NumberAnimation { duration: 300 } }
+
+        MediaFiles {
+            id: mediaFiles
         }
+
+        // Big media controller, shown on the idle screen only
+        NowPlaying {
+            id: nowPlaying
+            anchors.left: parent.left
+            anchors.leftMargin: Kirigami.Units.gridUnit * 3
+            anchors.bottom: parent.bottom
+            anchors.bottomMargin: Kirigami.Units.gridUnit * 3
+            files: mediaFiles
+            shown: !lockScreenRoot.uiVisible
+            onLyricsButtonClicked: lyricsShown = !lyricsShown
+        }
+
+        // Synced lyrics between the clock and the media controller
+        LyricsView {
+            anchors.left: parent.left
+            anchors.leftMargin: Kirigami.Units.gridUnit * 3
+            anchors.top: clock.bottom
+            anchors.topMargin: Kirigami.Units.gridUnit * 2
+            anchors.bottom: nowPlaying.top
+            anchors.bottomMargin: Kirigami.Units.gridUnit * 2
+            width: Math.min(parent.width * 0.45, Kirigami.Units.gridUnit * 34)
+            lyricsText: mediaFiles.lyricsText
+            positionMs: nowPlaying.positionMs
+            shown: nowPlaying.visible && nowPlaying.lyricsShown && !lockScreenRoot.uiVisible
+        }
+
         ListModel {
             id: users
 
