@@ -6,6 +6,7 @@ set -uo pipefail    # no -e: one failed download must not stop the helper
 CACHE="$HOME/.cache/kde-lockscreen-lyrics"
 mkdir -p "$CACHE"
 last=""
+UA="kde-lockscreen-lyrics/0.1 (https://github.com/udbhav07/kde-lockscreen-lyrics)"
 
 playerctl -p spotify --follow metadata \
     --format '{{mpris:artUrl}}|{{artist}}|{{title}}' |
@@ -24,15 +25,33 @@ while IFS='|' read -r art artist title; do
     echo "Now playing: $artist - $title"
 
     # Cover: download to a temp file, then move it into place
-    if [ -n "$art" ] && curl -sf -o "$CACHE/cover.jpg.tmp" "$art"; then
+    if [ -n "$art" ] && curl -sf -A "$UA" -o "$CACHE/cover.jpg.tmp" "$art"; then
         mv "$CACHE/cover.jpg.tmp" "$CACHE/cover.jpg"
+    else
+        rm -f "$CACHE/cover.jpg"
     fi
 
-    # Lyrics: empty file if the song has none
-    curl -sf -G "https://lrclib.net/api/get" \
-        --data-urlencode "artist_name=$artist" \
-        --data-urlencode "track_name=$title" |
-        jq -r '.syncedLyrics // empty' > "$CACHE/lyrics.lrc.tmp"
+    # Lyrics: drop "(From ...)", "(feat. ...)" and " - ..." from the title,
+    # then keep the first search result that has timestamps
+    clean_title=$(printf '%s' "$title" | sed -E 's/ *[(\[](from|feat\.|ft\.)[^])]*[])]//I; s/ - .*$//')
+    lyrics=""
+    # LRCLIB rate-limits (HTTP 429), so wait longer after each failure
+    for wait in 5 15 30 none; do
+        if response=$(curl -sf -A "$UA" -G "https://lrclib.net/api/search" \
+                --data-urlencode "artist_name=$artist" \
+                --data-urlencode "track_name=$clean_title"); then
+            lyrics=$(printf '%s' "$response" | jq -r '[.[] | select(.syncedLyrics)][0].syncedLyrics // empty')
+            break
+        fi
+        if [ "$wait" = none ]; then
+            echo "  lyrics request failed, giving up"
+            break
+        fi
+        echo "  lyrics request failed, retrying in ${wait}s..."
+        sleep "$wait"
+    done
+    if [ -n "$lyrics" ]; then printf '%s\n' "$lyrics"; fi > "$CACHE/lyrics.lrc.tmp"
     mv "$CACHE/lyrics.lrc.tmp" "$CACHE/lyrics.lrc"
+
     echo "  lyrics: $(wc -l < "$CACHE/lyrics.lrc") lines"
 done
