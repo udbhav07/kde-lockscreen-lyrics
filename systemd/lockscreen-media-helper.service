@@ -1,0 +1,12 @@
+[Unit]
+Description=Downloads album art and lyrics for the KDE lock screen
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/lockscreen-media-helper
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
