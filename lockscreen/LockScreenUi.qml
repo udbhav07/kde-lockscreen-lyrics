@@ -117,19 +117,21 @@ Item {
         width: parent.width
         height: parent.height
         hoverEnabled: true
-        cursorShape: uiVisible ? Qt.ArrowCursor : Qt.BlankCursor
+        cursorShape:  Qt.ArrowCursor 
         drag.filterChildren: true
         onPressed: {
             uiVisible = true;
             fadeoutTimer.restart();
         }
         onPositionChanged: {
-            uiVisible = seenPositionChange;
-            seenPositionChange = true;
+            // Moving the mouse doesn't open the password screen, so the media
+            // controls on the idle screen can be used with the mouse.
+            // Keep the password screen open while the mouse moves.
             if (uiVisible) {
                 fadeoutTimer.restart();
             }
         }
+
         onUiVisibleChanged: {
             if (uiVisible) {
                 Window.window.requestActivate();
@@ -284,7 +286,14 @@ Item {
                 trackSeconds: false
             }
         }
-
+        ReadTest {
+            anchors.left: parent.left
+            anchors.top: parent.top
+            anchors.margins: 40
+            opacity: lockScreenRoot.uiVisible ? 0 : 1
+            visible: opacity > 0
+            Behavior on opacity { NumberAnimation { duration: 300 } }
+        }
         ListModel {
             id: users
 
