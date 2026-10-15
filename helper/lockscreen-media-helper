@@ -4,13 +4,72 @@
 set -uo pipefail    # no -e: one failed download must not stop the helper
 
 CACHE="$HOME/.cache/kde-lockscreen-lyrics"
-mkdir -p "$CACHE"
+SONGS="$CACHE/songs"    # saved <spotify-track-id>.jpg + .lrc per song (also filled by lockscreen-lyrics-prefetch)
+mkdir -p "$SONGS"
 last=""
+job=""
 UA="kde-lockscreen-lyrics/0.1 (https://github.com/udbhav07/kde-lockscreen-lyrics)"
 
+# Downloads cover and lyrics for one song. Runs in the background, so a
+# slow lyrics retry never delays the next song.
+fetch_song() {
+    local id="$1" art="$2" artist="$3" title="$4"
+    local tmp="$CACHE/.tmp.$BASHPID"    # own temp name per job
+    local saved="$SONGS/$id"
+
+    # Mark this song as recently used, so the 500-song limit keeps it
+    touch -c "$saved.jpg" "$saved.lrc"
+
+    # Cover: from songs/ if played before, else download it and keep a copy
+    if [ -s "$saved.jpg" ]; then
+        cp "$saved.jpg" "$tmp.jpg" && mv "$tmp.jpg" "$CACHE/cover.jpg"
+    elif [ -n "$art" ] && curl -sf -A "$UA" -o "$tmp.jpg" "$art"; then
+        cp "$tmp.jpg" "$saved.jpg"
+        mv "$tmp.jpg" "$CACHE/cover.jpg"
+    else
+        rm -f "$tmp.jpg" "$CACHE/cover.jpg"
+    fi
+
+    # Lyrics from songs/ if played before. An empty saved file means
+    # "LRCLIB has no synced lyrics for this song", so don't ask again.
+    if [ -e "$saved.lrc" ]; then
+        cp "$saved.lrc" "$tmp.lrc" && mv "$tmp.lrc" "$CACHE/lyrics.lrc"
+        echo "  lyrics: $(wc -l < "$CACHE/lyrics.lrc") lines (saved)"
+        return
+    fi
+
+    # Lyrics: drop "(From ...)", "(feat. ...)" and " - ..." from the title,
+    # then keep the first search result that has timestamps
+    local clean_title lyrics="" response answered=false
+    clean_title=$(printf '%s' "$title" | sed -E 's/ *[(\[](from|feat\.|ft\.)[^])]*[])]//I; s/ - .*$//')
+    # LRCLIB rate-limits (HTTP 429), so wait longer after each failure
+    for wait in 5 15 30 none; do
+        if response=$(curl -sf -A "$UA" -G "https://lrclib.net/api/search" \
+                --data-urlencode "artist_name=$artist" \
+                --data-urlencode "track_name=$clean_title"); then
+            lyrics=$(printf '%s' "$response" | jq -r '[.[] | select(.syncedLyrics)][0].syncedLyrics // empty')
+            answered=true
+            break
+        fi
+        if [ "$wait" = none ]; then
+            echo "  lyrics request failed, giving up"
+            break
+        fi
+        echo "  lyrics request failed, retrying in ${wait}s..."
+        sleep "$wait"
+    done
+    if [ -n "$lyrics" ]; then printf '%s\n' "$lyrics"; fi > "$tmp.lrc"
+    # Only remember real answers; a failed request should be retried next time
+    if [ "$answered" = true ]; then
+        cp "$tmp.lrc" "$saved.lrc"
+    fi
+    mv "$tmp.lrc" "$CACHE/lyrics.lrc"
+    echo "  lyrics: $(wc -l < "$CACHE/lyrics.lrc") lines"
+}
+
 playerctl -p spotify --follow metadata \
-    --format '{{mpris:artUrl}}|{{artist}}|{{title}}' |
-while IFS='|' read -r art artist title; do
+    --format '{{mpris:trackid}}|{{mpris:artUrl}}|{{artist}}|{{title}}' |
+while IFS='|' read -r trackid art artist title; do
 
     # Spotify closed or nothing playing: clear the lyrics
     if [ -z "$title" ]; then
@@ -24,34 +83,14 @@ while IFS='|' read -r art artist title; do
     last="$artist|$title"
     echo "Now playing: $artist - $title"
 
-    # Cover: download to a temp file, then move it into place
-    if [ -n "$art" ] && curl -sf -A "$UA" -o "$CACHE/cover.jpg.tmp" "$art"; then
-        mv "$CACHE/cover.jpg.tmp" "$CACHE/cover.jpg"
-    else
-        rm -f "$CACHE/cover.jpg"
+    # Cancel the previous song's downloads, and hide its lyrics right away
+    if [ -n "$job" ]; then
+        kill "$job" 2>/dev/null
     fi
+    rm -f "$CACHE"/.tmp.*    # leftovers from a cancelled job
+    : > "$CACHE/lyrics.lrc"
 
-    # Lyrics: drop "(From ...)", "(feat. ...)" and " - ..." from the title,
-    # then keep the first search result that has timestamps
-    clean_title=$(printf '%s' "$title" | sed -E 's/ *[(\[](from|feat\.|ft\.)[^])]*[])]//I; s/ - .*$//')
-    lyrics=""
-    # LRCLIB rate-limits (HTTP 429), so wait longer after each failure
-    for wait in 5 15 30 none; do
-        if response=$(curl -sf -A "$UA" -G "https://lrclib.net/api/search" \
-                --data-urlencode "artist_name=$artist" \
-                --data-urlencode "track_name=$clean_title"); then
-            lyrics=$(printf '%s' "$response" | jq -r '[.[] | select(.syncedLyrics)][0].syncedLyrics // empty')
-            break
-        fi
-        if [ "$wait" = none ]; then
-            echo "  lyrics request failed, giving up"
-            break
-        fi
-        echo "  lyrics request failed, retrying in ${wait}s..."
-        sleep "$wait"
-    done
-    if [ -n "$lyrics" ]; then printf '%s\n' "$lyrics"; fi > "$CACHE/lyrics.lrc.tmp"
-    mv "$CACHE/lyrics.lrc.tmp" "$CACHE/lyrics.lrc"
-
-    echo "  lyrics: $(wc -l < "$CACHE/lyrics.lrc") lines"
+    # "/com/spotify/track/0FIDCNYYjNvPVimz5icugS" -> "0FIDCNYYjNvPVimz5icugS"
+    fetch_song "${trackid##*[/:]}" "$art" "$artist" "$title" &
+    job=$!
 done
