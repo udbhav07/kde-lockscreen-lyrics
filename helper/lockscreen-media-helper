@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Watches Spotify and saves the current song's cover and synced lyrics
+# into ~/.cache, where the lock screen can read them.
+set -uo pipefail    # no -e: one failed download must not stop the helper
+
+CACHE="$HOME/.cache/kde-lockscreen-lyrics"
+mkdir -p "$CACHE"
+last=""
+
+playerctl -p spotify --follow metadata \
+    --format '{{mpris:artUrl}}|{{artist}}|{{title}}' |
+while IFS='|' read -r art artist title; do
+
+    # Spotify closed or nothing playing: clear the lyrics
+    if [ -z "$title" ]; then
+        : > "$CACHE/lyrics.lrc"
+        last=""
+        continue
+    fi
+
+    # playerctl can repeat the same song; only download once per song
+    [ "$artist|$title" = "$last" ] && continue
+    last="$artist|$title"
+    echo "Now playing: $artist - $title"
+
+    # Cover: download to a temp file, then move it into place
+    if [ -n "$art" ] && curl -sf -o "$CACHE/cover.jpg.tmp" "$art"; then
+        mv "$CACHE/cover.jpg.tmp" "$CACHE/cover.jpg"
+    fi
+
+    # Lyrics: empty file if the song has none
+    curl -sf -G "https://lrclib.net/api/get" \
+        --data-urlencode "artist_name=$artist" \
+        --data-urlencode "track_name=$title" |
+        jq -r '.syncedLyrics // empty' > "$CACHE/lyrics.lrc.tmp"
+    mv "$CACHE/lyrics.lrc.tmp" "$CACHE/lyrics.lrc"
+    echo "  lyrics: $(wc -l < "$CACHE/lyrics.lrc") lines"
+done
