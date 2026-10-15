@@ -2,6 +2,10 @@
 
 Spotify controls and Apple Music-style synced lyrics on the KDE Plasma 6 lock screen. Live/video wallpapers keep working.
 
+![Lock screen with synced lyrics and the media controller](docs/lockscreen-lyrics.jpg)
+
+▶ **[Watch the demo video](docs/lockscreen-demo.mp4)** (10 s, the lyrics moving with the song)
+
 ## What you get
 
 - **Media controller** on the idle lock screen (the one right after <kbd>Meta</kbd>+<kbd>L</kbd>): album cover, title, artist, progress bar, ⏮ ⏯ ⏭
