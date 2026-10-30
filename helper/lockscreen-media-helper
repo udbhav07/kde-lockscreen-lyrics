@@ -1,96 +1,105 @@
-#!/usr/bin/env bash
-# Watches Spotify and saves the current song's cover and synced lyrics
-# into ~/.cache, where the lock screen can read them.
-set -uo pipefail    # no -e: one failed download must not stop the helper
+#!/usr/bin/env python3
+"""
+Follows every media player (Spotify, browsers, VLC ...) and saves the cover
+and synced lyrics of the one the lock screen shows into
+~/.cache/kde-lockscreen-lyrics, where the lock screen reads them:
 
-CACHE="$HOME/.cache/kde-lockscreen-lyrics"
-SONGS="$CACHE/songs"    # saved <spotify-track-id>.jpg + .lrc per song (also filled by lockscreen-lyrics-prefetch)
-mkdir -p "$SONGS"
-last=""
-job=""
-UA="kde-lockscreen-lyrics/0.1 (https://github.com/udbhav07/kde-lockscreen-lyrics)"
+  cover.jpg   lyrics.lrc   now.txt  (player, title, artist, source, expected length)
 
-# Downloads cover and lyrics for one song. Runs in the background, so a
-# slow lyrics retry never delays the next song.
-fetch_song() {
-    local id="$1" art="$2" artist="$3" title="$4"
-    local tmp="$CACHE/.tmp.$BASHPID"    # own temp name per job
-    local saved="$SONGS/$id"
+now.txt tells the lock screen which song the other two files belong to, so it
+never shows one song's cover or lyrics with another song's title.
+"""
 
-    # Mark this song as recently used, so the 500-song limit keeps it
-    touch -c "$saved.jpg" "$saved.lrc"
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
 
-    # Cover: from songs/ if played before, else download it and keep a copy
-    if [ -s "$saved.jpg" ]; then
-        cp "$saved.jpg" "$tmp.jpg" && mv "$tmp.jpg" "$CACHE/cover.jpg"
-    elif [ -n "$art" ] && curl -sf -A "$UA" -o "$tmp.jpg" "$art"; then
-        cp "$tmp.jpg" "$saved.jpg"
-        mv "$tmp.jpg" "$CACHE/cover.jpg"
-    else
-        rm -f "$tmp.jpg" "$CACHE/cover.jpg"
-    fi
+CACHE = Path.home() / ".cache/kde-lockscreen-lyrics"
 
-    # Lyrics from songs/ if played before. An empty saved file means
-    # "LRCLIB has no synced lyrics for this song", so don't ask again.
-    if [ -e "$saved.lrc" ]; then
-        cp "$saved.lrc" "$tmp.lrc" && mv "$tmp.lrc" "$CACHE/lyrics.lrc"
-        echo "  lyrics: $(wc -l < "$CACHE/lyrics.lrc") lines (saved)"
-        return
-    fi
+SEP = "\x1f"    # playerctl output field separator; never appears in titles
+FIELDS = ("name", "status", "trackid", "art", "artist", "title", "length", "url", "kde_pid")
+FORMAT = SEP.join(("{{playerName}}", "{{status}}", "{{mpris:trackid}}", "{{mpris:artUrl}}",
+                   "{{artist}}", "{{title}}", "{{mpris:length}}", "{{xesam:url}}", "{{kde:pid}}"))
 
-    # Lyrics: drop "(From ...)", "(feat. ...)" and " - ..." from the title,
-    # then keep the first search result that has timestamps
-    local clean_title lyrics="" response answered=false
-    clean_title=$(printf '%s' "$title" | sed -E 's/ *[(\[](from|feat\.|ft\.)[^])]*[])]//I; s/ - .*$//')
-    # LRCLIB rate-limits (HTTP 429), so wait longer after each failure
-    for wait in 5 15 30 none; do
-        if response=$(curl -sf -A "$UA" -G "https://lrclib.net/api/search" \
-                --data-urlencode "artist_name=$artist" \
-                --data-urlencode "track_name=$clean_title"); then
-            lyrics=$(printf '%s' "$response" | jq -r '[.[] | select(.syncedLyrics)][0].syncedLyrics // empty')
-            answered=true
-            break
-        fi
-        if [ "$wait" = none ]; then
-            echo "  lyrics request failed, giving up"
-            break
-        fi
-        echo "  lyrics request failed, retrying in ${wait}s..."
-        sleep "$wait"
-    done
-    if [ -n "$lyrics" ]; then printf '%s\n' "$lyrics"; fi > "$tmp.lrc"
-    # Only remember real answers; a failed request should be retried next time
-    if [ "$answered" = true ]; then
-        cp "$tmp.lrc" "$saved.lrc"
-    fi
-    mv "$tmp.lrc" "$CACHE/lyrics.lrc"
-    echo "  lyrics: $(wc -l < "$CACHE/lyrics.lrc") lines"
-}
 
-playerctl -p spotify --follow metadata \
-    --format '{{mpris:trackid}}|{{mpris:artUrl}}|{{artist}}|{{title}}' |
-while IFS='|' read -r trackid art artist title; do
+def log(*args):
+    print(*args, flush=True)
 
-    # Spotify closed or nothing playing: clear the lyrics
-    if [ -z "$title" ]; then
-        : > "$CACHE/lyrics.lrc"
-        last=""
-        continue
-    fi
 
-    # playerctl can repeat the same song; only download once per song
-    [ "$artist|$title" = "$last" ] && continue
-    last="$artist|$title"
-    echo "Now playing: $artist - $title"
+# ---------------------------------------------------------------- players
 
-    # Cancel the previous song's downloads, and hide its lyrics right away
-    if [ -n "$job" ]; then
-        kill "$job" 2>/dev/null
-    fi
-    rm -f "$CACHE"/.tmp.*    # leftovers from a cancelled job
-    : > "$CACHE/lyrics.lrc"
+def parse_snapshot(text):
+    """playerctl -a metadata --format FORMAT output -> list of player dicts."""
+    players = []
+    for line in text.splitlines():
+        parts = line.split(SEP)
+        if len(parts) != len(FIELDS):
+            continue    # "No player could handle this command" and similar
+        p = dict(zip(FIELDS, parts))
+        p["length"] = int(p["length"]) if p["length"].isdigit() else 0
+        players.append(p)
+    return players
 
-    # "/com/spotify/track/0FIDCNYYjNvPVimz5icugS" -> "0FIDCNYYjNvPVimz5icugS"
-    fetch_song "${trackid##*[/:]}" "$art" "$artist" "$title" &
-    job=$!
-done
+
+def snapshot():
+    try:
+        out = subprocess.run(["playerctl", "-a", "metadata", "--format", FORMAT],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return parse_snapshot(out)
+
+
+def dedupe(players):
+    """Plasma Browser Integration repeats the browser's own player (and adds the
+    page URL); drop the browser's copy, like Plasma's media applet does."""
+    pids = {p["kde_pid"] for p in players if p["kde_pid"]}
+    def own_pid(name):     # "brave.instance42" / "firefox.instance_1_42" -> "42"
+        m = re.search(r"\.instance.*?(\d+)$", name)
+        return m and m[1]
+    return [p for p in players if own_pid(p["name"]) not in pids]
+
+
+def pick(players, last_change):
+    """The player to show: has a title, then playing, then Spotify, then most recently changed.
+    The lock screen (NowPlaying.qml) uses the same order."""
+    candidates = [p for p in players if p["title"]]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: (p["status"] == "Playing", p["name"] == "spotify",
+                                          last_change.get(p["name"], 0)))
+
+
+# ---------------------------------------------------------------- cache
+
+def evict(folder, max_items, max_age_days=None, keep=()):
+    """Delete songs (all files sharing a name) older than max_age_days, then the
+    least recently used ones while there are more than max_items."""
+    songs = {}
+    for f in folder.iterdir():
+        if not f.name.startswith("."):
+            songs.setdefault(f.stem, []).append(f)
+
+    def last_used(stem):
+        return max((f.stat().st_mtime for f in songs[stem] if f.exists()), default=0)
+
+    stale = []
+    if max_age_days is not None:
+        cutoff = time.time() - max_age_days * 86400
+        stale = [s for s in songs if s not in keep and last_used(s) < cutoff]
+    rest = sorted((s for s in songs if s not in keep and s not in stale), key=last_used)
+    extra = len(songs) - len(stale) - max_items
+    for stem in stale + rest[:max(extra, 0)]:
+        for f in songs[stem]:
+            f.unlink(missing_ok=True)
+
+
+def main():
+    raise SystemExit("not implemented yet")
+
+
+if __name__ == "__main__":
+    main()
