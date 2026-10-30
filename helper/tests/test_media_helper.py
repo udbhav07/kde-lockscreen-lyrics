@@ -92,5 +92,55 @@ class Evict(unittest.TestCase):
             self.assertEqual(sorted(f.name for f in d.iterdir()), ["old.lrc"])
 
 
+class WriterTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.w = mh.Writer(self.dir)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def now(self):
+        return (self.dir / "now.txt").read_text().rstrip("\n").split("\t")
+
+    def test_switch_clears_files_and_writes_now(self):
+        (self.dir / "cover.jpg").write_text("old")
+        (self.dir / "lyrics.lrc").write_text("old")
+        self.w.switch(player("spotify", title="Dandelions", artist="Ruth B."))
+        self.assertFalse((self.dir / "cover.jpg").exists())
+        self.assertFalse((self.dir / "lyrics.lrc").exists())
+        self.assertEqual(self.now(), ["spotify", "Dandelions", "", "", ""])
+
+    def test_stale_worker_cannot_write(self):
+        old = self.w.switch(player("spotify", title="A"))
+        new = self.w.switch(player("vlc", title="B"))
+        self.assertFalse(self.w.put(old, "lyrics.lrc", b"[00:01.00]A"))
+        self.assertTrue(self.w.put(new, "lyrics.lrc", b"[00:01.00]B"))
+        self.assertEqual((self.dir / "lyrics.lrc").read_text(), "[00:01.00]B")
+
+    def test_worker_finishing_first_is_cleared_by_switch(self):
+        gen = self.w.switch(player("spotify", title="A"))
+        self.w.put(gen, "cover.jpg", b"A")
+        self.w.switch(player("vlc", title="B"))
+        self.assertFalse((self.dir / "cover.jpg").exists())
+
+    def test_note_updates_fields_only_for_current_song(self):
+        gen = self.w.switch(player("brave.instance1", title="Ed Sheeran - Shape of You (Lyrics)"))
+        self.w.note(gen, artist="Ed Sheeran", source="lrclib", expected_ms=233000)
+        self.w.note(gen - 1, artist="stale")
+        self.assertEqual(self.now()[2:], ["Ed Sheeran", "lrclib", "233000"])
+
+    def test_tabs_in_title_cannot_break_the_file(self):
+        self.w.switch(player("vlc", title="a\tb\nc"))
+        self.assertEqual(self.now(), ["vlc", "a b c", "", "", ""])
+
+    def test_nothing_playing_removes_everything(self):
+        gen = self.w.switch(player("spotify"))
+        self.w.put(gen, "cover.jpg", b"x")
+        self.w.switch(None)
+        self.assertEqual(list(self.dir.iterdir()), [])
+
+
 if __name__ == "__main__":
     unittest.main()

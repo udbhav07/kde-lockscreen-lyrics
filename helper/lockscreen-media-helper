@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -95,6 +96,65 @@ def evict(folder, max_items, max_age_days=None, keep=()):
     for stem in stale + rest[:max(extra, 0)]:
         for f in songs[stem]:
             f.unlink(missing_ok=True)
+
+
+def write_atomic(path, data):
+    tmp = path.with_name(".tmp." + path.name)
+    tmp.write_bytes(data)
+    tmp.replace(path)
+
+
+def one_line(text):
+    """Tabs and newlines would break now.txt; NowPlaying.qml does the same cleanup."""
+    return re.sub(r"[\t\r\n]", " ", text)
+
+
+class Writer:
+    """The only code that touches cover.jpg / lyrics.lrc / now.txt.
+
+    Every song switch bumps `gen`; a download started for an older song still
+    runs, but its writes are dropped. Switching and writing share one lock, so a
+    write can never land between "clear the old files" and "now.txt names the
+    new song"."""
+
+    def __init__(self, folder):
+        self.folder = folder
+        self.lock = threading.Lock()
+        self.gen = 0
+        self.fields = None
+
+    def switch(self, p):
+        with self.lock:
+            self.gen += 1
+            for name in ("cover.jpg", "lyrics.lrc", "now.txt"):
+                (self.folder / name).unlink(missing_ok=True)
+            # player, title, artist, lyrics source, expected length (ms)
+            self.fields = [p["name"], one_line(p["title"]), "", "", ""] if p else None
+            self._write_now()
+            return self.gen
+
+    def alive(self, gen):
+        return gen == self.gen
+
+    def put(self, gen, name, data):
+        with self.lock:
+            if gen != self.gen:
+                return False
+            write_atomic(self.folder / name, data)
+            return True
+
+    def note(self, gen, artist=None, source=None, expected_ms=None):
+        with self.lock:
+            if gen != self.gen or self.fields is None:
+                return
+            for i, value in ((2, artist), (3, source), (4, expected_ms)):
+                if value is not None:
+                    self.fields[i] = one_line(str(value))
+            self._write_now()
+
+    def _write_now(self):
+        if self.fields:
+            write_atomic(self.folder / "now.txt", ("\t".join(self.fields) + "\n").encode())
 
 
 def main():
