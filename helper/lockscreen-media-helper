@@ -10,24 +10,53 @@ now.txt tells the lock screen which song the other two files belong to, so it
 never shows one song's cover or lyrics with another song's title.
 """
 
-import os
+import hashlib
+import json
 import re
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 CACHE = Path.home() / ".cache/kde-lockscreen-lyrics"
+SONGS = CACHE / "songs"                 # Spotify, by track id (shared with lockscreen-lyrics-prefetch)
+MUSIC = CACHE / "youtube-music"         # LRCLIB lyrics for every other player
+MAX_SONGS = 500
+MAX_ART = 5 * 1024 * 1024
+LRCLIB_BACKOFF = (5, 15, 30)            # waits after a failed LRCLIB request
+UA = "kde-lockscreen-lyrics/0.2 (https://github.com/udbhav07/kde-lockscreen-lyrics)"
 
 SEP = "\x1f"    # playerctl output field separator; never appears in titles
 FIELDS = ("name", "status", "trackid", "art", "artist", "title", "length", "url", "kde_pid")
-FORMAT = SEP.join(("{{playerName}}", "{{status}}", "{{mpris:trackid}}", "{{mpris:artUrl}}",
+FORMAT = SEP.join(("{{playerInstance}}", "{{status}}", "{{mpris:trackid}}", "{{mpris:artUrl}}",
                    "{{artist}}", "{{title}}", "{{mpris:length}}", "{{xesam:url}}", "{{kde:pid}}"))
 
 
 def log(*args):
     print(*args, flush=True)
+
+
+# ---------------------------------------------------------------- HTTP
+
+class HttpError(Exception):
+    def __init__(self, status):
+        super().__init__(f"HTTP {status}" if status else "network error")
+        self.status = status
+
+
+def http(url):
+    request = urllib.request.Request(url, headers={"User-Agent": UA})
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return response.read()
+    except urllib.error.HTTPError as e:
+        raise HttpError(e.code) from None
+    except OSError:
+        raise HttpError(0) from None
 
 
 # ---------------------------------------------------------------- players
@@ -41,6 +70,7 @@ def parse_snapshot(text):
             continue    # "No player could handle this command" and similar
         p = dict(zip(FIELDS, parts))
         p["length"] = int(p["length"]) if p["length"].isdigit() else 0
+        p["trackid"] = p["trackid"].strip("'")      # object paths come quoted
         players.append(p)
     return players
 
@@ -64,13 +94,17 @@ def dedupe(players):
     return [p for p in players if own_pid(p["name"]) not in pids]
 
 
+def is_spotify(name):
+    return name.split(".")[0] == "spotify"     # "spotify", or "spotify.instance123" with two running
+
+
 def pick(players, last_change):
     """The player to show: has a title, then playing, then Spotify, then most recently changed.
     The lock screen (NowPlaying.qml) uses the same order."""
     candidates = [p for p in players if p["title"]]
     if not candidates:
         return None
-    return max(candidates, key=lambda p: (p["status"] == "Playing", p["name"] == "spotify",
+    return max(candidates, key=lambda p: (p["status"] == "Playing", is_spotify(p["name"]),
                                           last_change.get(p["name"], 0)))
 
 
@@ -157,8 +191,176 @@ class Writer:
             write_atomic(self.folder / "now.txt", ("\t".join(self.fields) + "\n").encode())
 
 
+# ---------------------------------------------------------------- cover
+
+def read_art_file(url):
+    """Bytes of a file:// cover, only if it is a small regular file in /tmp or
+    your home (players put their temporary thumbnails there)."""
+    path = Path(urllib.parse.unquote(urllib.parse.urlparse(url).path)).resolve()
+    if not any(path.is_relative_to(d) for d in (Path("/tmp"), Path.home())):
+        return None
+    try:
+        if not path.is_file() or path.stat().st_size > MAX_ART:
+            return None
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def fetch_art(url):
+    if url.startswith("file://"):
+        return read_art_file(url)
+    if url.startswith(("https://", "http://")):
+        try:
+            data = http(url)
+        except HttpError:
+            return None
+        return data if len(data) <= MAX_ART else None
+    return None
+
+
+# ---------------------------------------------------------------- lyrics
+
+def clean_title(title):
+    """Same cleanup as lockscreen-lyrics-prefetch: drop "(From ...)", "(feat. ...)", " - ..."."""
+    title = re.sub(r" *[(\[](from|feat\.|ft\.)[^\])]*[\])]", "", title, count=1, flags=re.I)
+    return re.sub(r" - .*$", "", title)
+
+
+def choose_synced(results, length_s):
+    """(lrc, duration) of the synced result within 2 s of length_s, else the first synced one."""
+    synced = [r for r in results if r.get("syncedLyrics")]
+    if not synced:
+        return "", None
+    close = [r for r in synced if length_s and abs(r.get("duration", 0) - length_s) <= 2]
+    best = (close or synced)[0]
+    return best["syncedLyrics"], best.get("duration")
+
+
+def lrclib(artist, track, length_s, wait):
+    """(lrc, duration). lrc is "" when LRCLIB has no synced lyrics, None when it
+    never answered (so nothing gets cached and the next play asks again)."""
+    queries = [("search", {"q": f"{artist} {track}".strip()})]
+    if length_s:    # /get only matches within 2 s of the length, best when it works
+        queries.insert(0, ("get", {"artist_name": artist, "track_name": track,
+                                   "duration": round(length_s)}))
+    for kind, params in queries:
+        url = f"https://lrclib.net/api/{kind}?" + urllib.parse.urlencode(params)
+        for pause in (*LRCLIB_BACKOFF, None):
+            try:
+                body = http(url)
+                break
+            except HttpError as e:
+                if e.status == 404:
+                    body = None
+                    break
+                if pause is None or not wait(pause):
+                    return None, None
+        if body is None:
+            continue
+        results = json.loads(body)
+        lrc, duration = choose_synced([results] if isinstance(results, dict) else results, length_s)
+        if lrc:
+            return lrc, duration
+    return "", None
+
+
+def saved_lyrics(path, fetch):
+    """Lyrics from `path`, else fetch() and remember the answer ("" = none)."""
+    if path.exists():
+        path.touch()
+        return path.read_text()
+    text = fetch()
+    if text is None:
+        return ""
+    write_atomic(path, (text + "\n").encode() if text else b"")
+    return text
+
+
+# ---------------------------------------------------------------- per player
+
+def spotify_song(w, p, gen, wait):
+    tid = re.split(r"[/:]", p["trackid"])[-1]
+    if not re.fullmatch(r"[A-Za-z0-9]+", tid):
+        return other_song(w, p, gen, wait)
+    jpg, lrc = SONGS / f"{tid}.jpg", SONGS / f"{tid}.lrc"
+    if jpg.exists():
+        jpg.touch()
+        cover = jpg.read_bytes()
+    else:
+        cover = fetch_art(p["art"])
+        if cover:
+            write_atomic(jpg, cover)
+    if cover:
+        w.put(gen, "cover.jpg", cover)
+
+    length_s = p["length"] / 1e6 or None
+    text = saved_lyrics(lrc, lambda: lrclib(p["artist"], clean_title(p["title"]), length_s, wait)[0])
+    if text:
+        w.put(gen, "lyrics.lrc", text.encode())
+        w.note(gen, source="lrclib")
+    log(f"  lyrics: {text.count(chr(10)) + 1 if text else 0} lines")
+    evict(SONGS, MAX_SONGS, keep={tid})
+
+
+def other_song(w, p, gen, wait):
+    cover = fetch_art(p["art"])
+    if cover:
+        w.put(gen, "cover.jpg", cover)
+    key = hashlib.sha1(f"{p['artist']}|{p['title']}".lower().encode()).hexdigest()
+    length_s = p["length"] / 1e6 or None
+    text = saved_lyrics(MUSIC / f"{key}.lrc",
+                        lambda: lrclib(p["artist"], clean_title(p["title"]), length_s, wait)[0])
+    if text:
+        w.put(gen, "lyrics.lrc", text.encode())
+        w.note(gen, source="lrclib")
+    log(f"  cover: {'yes' if cover else 'none'}, lyrics: {text.count(chr(10)) + 1 if text else 0} lines")
+    evict(MUSIC, MAX_SONGS, keep={key})
+
+
+def fetch(w, p, gen):
+    def wait(seconds):
+        """Sleeps; False as soon as another song started."""
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            if not w.alive(gen):
+                return False
+            time.sleep(0.2)
+        return w.alive(gen)
+
+    handler = spotify_song if is_spotify(p["name"]) else other_song
+    try:
+        handler(w, p, gen, wait)
+    except (HttpError, OSError, ValueError) as e:     # ValueError covers bad JSON
+        log(f"  stopped: {e}")
+
+
+# ---------------------------------------------------------------- main
+
 def main():
-    raise SystemExit("not implemented yet")
+    for folder in (SONGS, MUSIC):
+        folder.mkdir(parents=True, exist_ok=True)
+    evict(MUSIC, MAX_SONGS)
+    w = Writer(CACHE)
+    shown, seen, last_change = (), {}, {}
+    # shortcut: polls playerctl once a second instead of following D-Bus signals;
+    # fine for one helper per user, revisit if it ever shows up in CPU profiles
+    while True:
+        players = dedupe(snapshot())
+        for p in players:
+            state = (p["title"], p["status"], p["length"])
+            if seen.get(p["name"]) != state:
+                seen[p["name"]], last_change[p["name"]] = state, time.monotonic()
+        current = pick(players, last_change)
+        key = current and (current["name"], current["title"], current["artist"],
+                           current["length"] // 1_000_000)
+        if key != shown:
+            shown = key
+            gen = w.switch(current)
+            if current:
+                log(f"Now playing ({current['name']}): {current['artist']} - {current['title']}")
+                threading.Thread(target=fetch, args=(w, current, gen), daemon=True).start()
+        time.sleep(1)
 
 
 if __name__ == "__main__":

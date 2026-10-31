@@ -29,6 +29,10 @@ class PickPlayer(unittest.TestCase):
         players = [player("brave.instance5"), player("spotify")]
         self.assertEqual(mh.pick(players, {})["name"], "spotify")
 
+    def test_spotify_instance_name(self):
+        players = [player("brave.instance5"), player("spotify.instance9")]
+        self.assertEqual(mh.pick(players, {})["name"], "spotify.instance9")
+
     def test_most_recent_wins_remaining_tie(self):
         players = [player("vlc", "Paused"), player("elisa", "Paused")]
         self.assertEqual(mh.pick(players, {"vlc": 1, "elisa": 2})["name"], "elisa")
@@ -61,6 +65,10 @@ class ParseSnapshot(unittest.TestCase):
         self.assertEqual(len(players), 1)
         self.assertEqual(players[0]["title"], "Dandelions")
         self.assertEqual(players[0]["length"], 233_000_000)
+
+    def test_quoted_trackid(self):
+        line = mh.SEP.join(["brave.instance1", "Paused", "'/com/brave/Track1'", "", "", "T", "1", "", ""])
+        self.assertEqual(mh.parse_snapshot(line)[0]["trackid"], "/com/brave/Track1")
 
     def test_missing_length(self):
         line = mh.SEP.join(["vlc", "Playing", "", "", "", "Talk", "", "", ""])
@@ -140,6 +148,51 @@ class WriterTests(unittest.TestCase):
         self.w.put(gen, "cover.jpg", b"x")
         self.w.switch(None)
         self.assertEqual(list(self.dir.iterdir()), [])
+
+
+class Lrclib(unittest.TestCase):
+    RESULTS = [
+        {"duration": 260, "syncedLyrics": "[00:01.00]long"},
+        {"duration": 234, "syncedLyrics": None},
+        {"duration": 233.5, "syncedLyrics": "[00:01.00]match"},
+    ]
+
+    def test_prefers_duration_match(self):
+        self.assertEqual(mh.choose_synced(self.RESULTS, 232), ("[00:01.00]match", 233.5))
+
+    def test_falls_back_to_first_synced(self):
+        self.assertEqual(mh.choose_synced(self.RESULTS, 100), ("[00:01.00]long", 260))
+
+    def test_unknown_length(self):
+        self.assertEqual(mh.choose_synced(self.RESULTS, None), ("[00:01.00]long", 260))
+
+    def test_none_synced(self):
+        self.assertEqual(mh.choose_synced([{"duration": 1, "syncedLyrics": ""}], 1), ("", None))
+
+    def test_clean_title(self):
+        self.assertEqual(mh.clean_title("Calm Down (feat. Selena Gomez)"), "Calm Down")
+        self.assertEqual(mh.clean_title("Nee Kallalona (From \"Movie\") - Remix"), "Nee Kallalona")
+
+
+class ArtFile(unittest.TestCase):
+    def test_reads_small_regular_file_under_tmp(self):
+        with tempfile.NamedTemporaryFile(dir="/tmp", suffix=".png") as f:
+            f.write(b"PNG")
+            f.flush()
+            self.assertEqual(mh.read_art_file("file://" + f.name), b"PNG")
+
+    def test_refuses_other_places_and_oversize(self):
+        self.assertIsNone(mh.read_art_file("file:///etc/passwd"))
+        self.assertIsNone(mh.read_art_file("file:///tmp"))
+        with tempfile.NamedTemporaryFile(dir="/tmp") as f:
+            f.truncate(mh.MAX_ART + 1)
+            self.assertIsNone(mh.read_art_file("file://" + f.name))
+
+    def test_url_encoded_path(self):
+        with tempfile.NamedTemporaryFile(dir="/tmp", prefix="a b") as f:
+            f.write(b"x")
+            f.flush()
+            self.assertEqual(mh.read_art_file("file://" + f.name.replace(" ", "%20")), b"x")
 
 
 if __name__ == "__main__":
