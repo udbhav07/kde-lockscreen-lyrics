@@ -337,7 +337,27 @@ def fetch(w, p, gen):
 
 # ---------------------------------------------------------------- main
 
+def status():
+    """--status: what the helper sees and what the lock screen will show."""
+    players = dedupe(snapshot())
+    for p in players:
+        log(f"player  {p['name']:<32} {p['status']:<8} {p['artist']} - {p['title']}")
+    current = pick(players, {})
+    log(f"chosen  {current['name'] if current else 'none'}")
+    try:
+        fields = (CACHE / "now.txt").read_text().rstrip("\n").split("\t")
+    except OSError:
+        fields = []
+    for label, value in zip(("now     ", "title   ", "artist  ", "lyrics  ", "length  "), fields):
+        log(f"{label}{value or '-'}")
+    for name in ("cover.jpg", "lyrics.lrc"):
+        f = CACHE / name
+        log(f"file    {name}: {f'{f.stat().st_size} bytes' if f.exists() else 'missing'}")
+
+
 def main():
+    if "--status" in sys.argv:
+        return status()
     for folder in (SONGS, MUSIC):
         folder.mkdir(parents=True, exist_ok=True)
     evict(MUSIC, MAX_SONGS)
