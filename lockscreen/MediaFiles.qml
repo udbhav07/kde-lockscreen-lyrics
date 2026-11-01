@@ -18,12 +18,22 @@ Item {
     property string coverUrl: ""
     property string lyricsText: ""
 
+    // now.txt: which song the files belong to (player, title, artist, lyrics source,
+    // expected length in ms). An older helper doesn't write it: ownerKnown is false then.
+    property bool ownerKnown: false
+    property string ownerTitle: ""
+    property string ownerArtist: ""
+    property string lyricsSource: ""
+    property real expectedMs: 0
+
     // The helper replaces files with mv, so their inode number changes on
     // every update. "name inode size mtime" per file tells us when to reload.
     property string coverStamp: ""
     property string lyricsStamp: ""
-    readonly property string statCommand: "cd '" + cachePath + "' 2>/dev/null && stat -c '%n %i %s %Y' cover.jpg lyrics.lrc 2>/dev/null; true"
+    property string nowStamp: ""
+    readonly property string statCommand: "cd '" + cachePath + "' 2>/dev/null && stat -c '%n %i %s %Y' cover.jpg lyrics.lrc now.txt 2>/dev/null; true"
     readonly property string catCommand: "cat '" + cachePath + "/lyrics.lrc'"
+    readonly property string nowCommand: "cat '" + cachePath + "/now.txt'"
 
     P5Support.DataSource {
         engine: "executable"
@@ -32,12 +42,23 @@ Item {
         onNewData: (source, data) => {
             let cover = "";
             let lyrics = "";
+            let now = "";
             for (const line of data.stdout.trim().split("\n")) {
                 const name = line.split(" ")[0];
                 if (name === "cover.jpg") {
                     cover = line;
                 } else if (name === "lyrics.lrc") {
                     lyrics = line;
+                } else if (name === "now.txt") {
+                    now = line;
+                }
+            }
+            if (now !== root.nowStamp) {
+                root.nowStamp = now;
+                if (now) {
+                    reader.connectSource(root.nowCommand);
+                } else {
+                    root.ownerKnown = false;
                 }
             }
             if (cover !== root.coverStamp) {
@@ -60,7 +81,17 @@ Item {
         id: reader
         engine: "executable"
         onNewData: (source, data) => {
-            root.lyricsText = data["exit code"] === 0 ? data.stdout.trim() : "";
+            const ok = data["exit code"] === 0;
+            if (source === root.nowCommand) {
+                const f = ok ? data.stdout.replace(/\n$/, "").split("\t") : [];
+                root.ownerKnown = ok;
+                root.ownerTitle = f[1] || "";
+                root.ownerArtist = f[2] || "";
+                root.lyricsSource = f[3] || "";
+                root.expectedMs = parseFloat(f[4]) || 0;
+            } else {
+                root.lyricsText = ok ? data.stdout.trim() : "";
+            }
             disconnectSource(source);
         }
     }
