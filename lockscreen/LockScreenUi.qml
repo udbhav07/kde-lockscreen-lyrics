@@ -308,7 +308,7 @@ Item {
         // middle of the screen, and moves to the bottom to make room for lyrics.
         NowPlaying {
             id: nowPlaying
-            readonly property bool lyricsOnScreen: lyricsShown && mediaFiles.lyricsText.length > 0
+            readonly property bool lyricsOnScreen: lyricsShown && hasLyrics
             // Centred in the left half, like the clock
             x: Math.max(Kirigami.Units.gridUnit * 3, parent.width / 4 - width / 2)
             y: lyricsOnScreen
@@ -330,7 +330,7 @@ Item {
             anchors.bottom: parent.bottom
             anchors.bottomMargin: nowPlaying.height + Kirigami.Units.gridUnit * 5
             width: Math.min(parent.width * 0.5, Kirigami.Units.gridUnit * 44)
-            lyricsText: mediaFiles.lyricsText
+            lyricsText: nowPlaying.lyricsText
             positionMs: nowPlaying.positionMs
             shown: nowPlaying.visible && nowPlaying.lyricsShown && !lockScreenRoot.uiVisible
         }

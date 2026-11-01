@@ -23,23 +23,36 @@ Rectangle {
     property bool lyricsShown: true
     signal lyricsButtonClicked()
 
-    // Prefer Spotify (the helpers only follow Spotify). KDE's own choice can
-    // be another app, e.g. a stopped browser tab with no title, which would
-    // hide the controller and the lyrics.
-    readonly property var spotifyPlayer: {
-        players.count;      // re-check when players appear or disappear
+    // Same order as lockscreen-media-helper: a player that is playing, then
+    // Spotify, then KDE's own choice. Picking differently from the helper only
+    // hides the cover and lyrics (see `owned`), it never shows the wrong ones.
+    readonly property var player: {
+        let best = null;
+        let bestScore = -1;
         for (let i = 0; i < players.count; i++) {
             const p = players.objectAt(i);
-            if (p && p.isSpotify) {
-                return p.container;
+            if (!p || !p.container || p.track.length === 0) {
+                continue;
+            }
+            const score = (p.playing ? 4 : 0) + (p.isSpotify ? 2 : 0)
+                + (p.container === mpris.currentPlayer ? 1 : 0);
+            if (score > bestScore) {
+                best = p.container;
+                bestScore = score;
             }
         }
-        return null;
+        return best ?? mpris.currentPlayer;
     }
-    readonly property var player: spotifyPlayer ?? mpris.currentPlayer
     readonly property bool hasMedia: player !== null && player.track.length > 0
     readonly property bool playing: player !== null && player.playbackStatus === Mpris.PlaybackStatus.Playing
-    readonly property bool hasLyrics: files !== null && files.lyricsText.length > 0
+
+    // The helper's files belong to this song (now.txt names it). The helper
+    // turns tabs and newlines in titles into spaces; do the same here.
+    readonly property bool owned: files !== null && player !== null
+        && (!files.ownerKnown || files.ownerTitle === player.track.replace(/[\t\r\n]/g, " "))
+    readonly property string lyricsText: owned ? files.lyricsText : ""
+    readonly property string coverUrl: owned ? files.coverUrl : ""
+    readonly property bool hasLyrics: lyricsText.length > 0
     readonly property color accent: "#C3C6FB"
 
     // Song position in milliseconds. The player only reports it now and then,
@@ -67,16 +80,18 @@ Rectangle {
         id: mpris
     }
 
-    // One small object per media player, to find Spotify among them
+    // One small object per media player, to choose among them
     Instantiator {
         id: players
         model: mpris
         delegate: QtObject {
             required property var model
-            readonly property var container: model.container
-            readonly property bool isSpotify: !model.isMultiplexer
-                && ((model.desktopEntry || "").toLowerCase().includes("spotify")
-                    || (model.identity || "").toLowerCase() === "spotify")
+            readonly property var container: model.isMultiplexer ? null : model.container
+            readonly property string track: container ? container.track : ""
+            readonly property bool playing: container !== null
+                && container.playbackStatus === Mpris.PlaybackStatus.Playing
+            readonly property bool isSpotify: (model.desktopEntry || "").toLowerCase().includes("spotify")
+                || (model.identity || "").toLowerCase() === "spotify"
         }
     }
 
@@ -234,7 +249,7 @@ Rectangle {
                 asynchronous: true
                 sourceSize.width: width * Screen.devicePixelRatio
                 sourceSize.height: height * Screen.devicePixelRatio
-                source: root.files ? root.files.coverUrl : ""
+                source: root.coverUrl
             }
 
             Kirigami.Icon {
