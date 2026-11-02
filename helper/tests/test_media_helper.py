@@ -195,5 +195,43 @@ class ArtFile(unittest.TestCase):
             self.assertEqual(mh.read_art_file("file://" + f.name.replace(" ", "%20")), b"x")
 
 
+class YoutubeTitles(unittest.TestCase):
+    CASES = [
+        ("Ed Sheeran - Shape of You (Lyrics)", "7clouds", ("Ed Sheeran", "Shape of You")),
+        ("Ed Sheeran - Shape of You [Official Video]", "Ed Sheeran", ("Ed Sheeran", "Shape of You")),
+        ("Shape of You", "Ed Sheeran - Topic", ("Ed Sheeran", "Shape of You")),
+        ("Calm Down", "RemaVEVO", ("Rema", "Calm Down")),
+        ("Rema, Selena Gomez - Calm Down (Official Music Video)", "Rema", ("Rema, Selena Gomez", "Calm Down")),
+        ("DJ Snake - Taki Taki ft. Selena Gomez, Ozuna, Cardi B (Official Video)", "DJ Snake",
+         ("DJ Snake", "Taki Taki")),
+        ("Shawn Mendes – Señorita (Official Audio) #shorts", "x", ("Shawn Mendes", "Señorita")),
+        ("Dandelions | Ruth B. | Lyric Video", "Ruth B.", ("Ruth B.", "Dandelions")),
+        ("Ruth B. - Dandelions (Visualizer) HD", "Ruth B.", ("Ruth B.", "Dandelions")),
+    ]
+
+    def test_cases(self):
+        for title, channel, expected in self.CASES:
+            with self.subTest(title=title):
+                self.assertEqual(mh.youtube_song(title, channel), expected)
+
+
+class VideoId(unittest.TestCase):
+    def test_urls(self):
+        good = ["https://www.youtube.com/watch?v=JGwWNGJdvx8",
+                "https://www.youtube.com/watch?list=PL1&v=JGwWNGJdvx8&t=3",
+                "https://youtu.be/JGwWNGJdvx8?si=x",
+                "https://m.youtube.com/shorts/JGwWNGJdvx8",
+                "https://music.youtube.com/watch?v=JGwWNGJdvx8"]
+        for url in good:
+            with self.subTest(url=url):
+                self.assertEqual(mh.video_id(url), "JGwWNGJdvx8")
+
+    def test_not_youtube(self):
+        for url in ["", "https://vimeo.com/123", "https://www.youtube.com/watch?v=short",
+                    "https://evil.example/youtube.com/watch?v=JGwWNGJdvx8"]:
+            with self.subTest(url=url):
+                self.assertIsNone(mh.video_id(url))
+
+
 if __name__ == "__main__":
     unittest.main()

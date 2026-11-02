@@ -277,6 +277,43 @@ def saved_lyrics(path, fetch):
     return text
 
 
+# ---------------------------------------------------------------- YouTube
+
+YT_TAGS = (r"official( music| lyrics?)? (video|audio)|official|lyrics?( video)?|audio|"
+           r"visuali[sz]er|video|hd|4k|remaster(ed)?|full (video )?song")
+
+
+def youtube_song(title, channel):
+    """("Artist", "Track") for LRCLIB from a video title like
+    "Artist - Track (Official Video)"; no dash -> the channel is the artist."""
+    t = re.sub(r"#\w+", "", title)
+    t = re.sub(rf"[(\[]\s*({YT_TAGS})\s*[)\]]", "", t, flags=re.I)
+    t = re.sub(r"\s(HD|4K)\b", "", t)
+    t = t.split("|")[0]
+    parts = re.split(r"\s+[-–—]\s+", t.strip(), maxsplit=1)
+    if len(parts) == 2:
+        artist, track = parts
+    else:
+        artist, track = re.sub(r"( - Topic|VEVO)$", "", channel), parts[0]
+    track = re.sub(r"\s+(ft\.|feat\.|featuring)\s.*$", "", clean_title(track), flags=re.I)
+    return " ".join(artist.split()), " ".join(track.split())
+
+
+def video_id(url):
+    """The 11-character video id from a YouTube page URL, else None."""
+    u = urllib.parse.urlparse(url)
+    host = (u.hostname or "").removeprefix("www.").removeprefix("m.").removeprefix("music.")
+    if host == "youtu.be":
+        vid = u.path[1:]
+    elif host == "youtube.com" and u.path == "/watch":
+        vid = urllib.parse.parse_qs(u.query).get("v", [""])[0]
+    elif host == "youtube.com" and re.match(r"/(shorts|live|embed)/", u.path):
+        vid = u.path.split("/")[2]
+    else:
+        return None
+    return vid if re.fullmatch(r"[A-Za-z0-9_-]{11}", vid) else None
+
+
 # ---------------------------------------------------------------- per player
 
 def spotify_song(w, p, gen, wait):
