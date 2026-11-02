@@ -314,6 +314,51 @@ def video_id(url):
     return vid if re.fullmatch(r"[A-Za-z0-9_-]{11}", vid) else None
 
 
+def lrc_time(ms):
+    return f"[{ms // 60000:02d}:{ms % 60000 / 1000:05.2f}]"
+
+
+def json3_to_lrc(data):
+    """YouTube json3 captions -> LRC. Breaks of 4 s or more get an empty line,
+    which LyricsView shows as breathing dots."""
+    lines, last, end = [], None, None
+    for e in data.get("events", []):
+        if e.get("aAppend") or "segs" not in e:
+            continue
+        text = "".join(s.get("utf8", "") for s in e["segs"])
+        text = re.sub(r"♪|\[(Music|Applause|Laughter)\]", "", text.replace("\n", " "), flags=re.I)
+        text = " ".join(text.split())
+        if not text or text == last:
+            continue
+        start = e.get("tStartMs", 0)
+        if end is not None and start - end >= 4000:
+            lines.append(lrc_time(end))
+        lines.append(lrc_time(start) + text)
+        last, end = text, start + e.get("dDurationMs", 0)
+    return "\n".join(lines)
+
+
+def shift_lrc(lrc, seconds):
+    def move(m):
+        ms = round((int(m[1]) * 60 + float(m[2]) + seconds) * 1000)
+        return lrc_time(max(ms, 0))
+    return re.sub(r"^\[(\d+):(\d+(?:\.\d+)?)\]", move, lrc, flags=re.M)
+
+
+def intro_offset(video_s, track_s):
+    """Music videos often start with an intro the album track doesn't have: when
+    the video is 3-30 s longer than LRCLIB's track, shift the lyrics by that much."""
+    if not track_s:
+        return 0
+    diff = round(video_s - track_s)
+    return diff if 3 <= diff <= 30 else 0
+
+
+def ad_playing(length_us, expected_ms):
+    """During a YouTube ad the browser keeps the video's title but reports the ad's length."""
+    return bool(expected_ms) and abs(length_us / 1000 - expected_ms) > 2000
+
+
 # ---------------------------------------------------------------- per player
 
 def spotify_song(w, p, gen, wait):

@@ -233,5 +233,54 @@ class VideoId(unittest.TestCase):
                 self.assertIsNone(mh.video_id(url))
 
 
+class Captions(unittest.TestCase):
+    def ev(self, start, dur, text, **extra):
+        return {"tStartMs": start, "dDurationMs": dur, "segs": [{"utf8": text}], **extra}
+
+    def test_lines_dedupe_and_noise(self):
+        data = {"events": [
+            {"tStartMs": 0, "dDurationMs": 100},                       # no segs
+            self.ev(1000, 2000, "♪ Maybe it's the way ♪"),
+            self.ev(3000, 10, "\n", aAppend=1),                        # ASR line break
+            self.ev(3000, 1500, "Maybe it's the way"),                 # rolling duplicate
+            self.ev(4500, 1000, "[Music]"),
+            self.ev(5500, 1000, "you say\nmy name"),
+        ]}
+        self.assertEqual(mh.json3_to_lrc(data),
+                         "[00:01.00]Maybe it's the way\n[00:05.50]you say my name")
+
+    def test_long_break_gets_empty_line(self):
+        data = {"events": [self.ev(1000, 2000, "one"), self.ev(9000, 1000, "two"),
+                           self.ev(10500, 500, "three")]}
+        self.assertEqual(mh.json3_to_lrc(data),
+                         "[00:01.00]one\n[00:03.00]\n[00:09.00]two\n[00:10.50]three")
+
+    def test_minutes(self):
+        self.assertEqual(mh.json3_to_lrc({"events": [self.ev(125_250, 1, "x")]}), "[02:05.25]x")
+
+    def test_empty(self):
+        self.assertEqual(mh.json3_to_lrc({"events": []}), "")
+        self.assertEqual(mh.json3_to_lrc({}), "")
+
+
+class Offset(unittest.TestCase):
+    def test_shift(self):
+        self.assertEqual(mh.shift_lrc("[00:01.50]a\n[01:59.00]b\nnot a line", 2.5),
+                         "[00:04.00]a\n[02:01.50]b\nnot a line")
+
+    def test_guard(self):
+        for video, track, expected in [(200, 198, 0), (200, 197, 3), (230, 200, 30),
+                                       (231, 200, 0), (190, 200, 0), (200, None, 0)]:
+            with self.subTest(video=video, track=track):
+                self.assertEqual(mh.intro_offset(video, track), expected)
+
+
+class AdGuard(unittest.TestCase):
+    def test_ad_playing(self):
+        self.assertTrue(mh.ad_playing(15_000_000, 232_000))
+        self.assertFalse(mh.ad_playing(233_500_000, 232_000))
+        self.assertFalse(mh.ad_playing(15_000_000, 0))       # unknown -> not an ad
+
+
 if __name__ == "__main__":
     unittest.main()
