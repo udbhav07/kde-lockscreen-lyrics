@@ -13,6 +13,7 @@ never shows one song's cover or lyrics with another song's title.
 import hashlib
 import json
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -25,7 +26,13 @@ from pathlib import Path
 CACHE = Path.home() / ".cache/kde-lockscreen-lyrics"
 SONGS = CACHE / "songs"                 # Spotify, by track id (shared with lockscreen-lyrics-prefetch)
 MUSIC = CACHE / "youtube-music"         # LRCLIB lyrics for every other player
+YT = CACHE / "youtube"                  # short-lived: thumbnails, captions, video ids
+THUMBS, CAPTIONS, IDS = YT / "thumbs", YT / "captions", YT / "ids.tsv"
 MAX_SONGS = 500
+MAX_VIDEOS, VIDEO_DAYS = 200, 7
+# Fedora's yt-dlp lacks its YouTube JavaScript solver; this fetches it from GitHub (accepted risk)
+YTDLP_FLAGS = ("--js-runtimes", "node", "--remote-components", "ejs:github", "--no-warnings")
+BROWSERS = re.compile(r"brave|chrom|edge|vivaldi|opera|firefox|librewolf|waterfox|plasma-browser-integration")
 MAX_ART = 5 * 1024 * 1024
 LRCLIB_BACKOFF = (5, 15, 30)            # waits after a failed LRCLIB request
 UA = "kde-lockscreen-lyrics/0.2 (https://github.com/udbhav07/kde-lockscreen-lyrics)"
@@ -269,7 +276,7 @@ def saved_lyrics(path, fetch):
     """Lyrics from `path`, else fetch() and remember the answer ("" = none)."""
     if path.exists():
         path.touch()
-        return path.read_text()
+        return path.read_text().rstrip("\n")
     text = fetch()
     if text is None:
         return ""
@@ -359,6 +366,75 @@ def ad_playing(length_us, expected_ms):
     return bool(expected_ms) and abs(length_us / 1000 - expected_ms) > 2000
 
 
+def ytdlp(args, alive, timeout=60):
+    """yt-dlp's stdout, or None when it is missing, fails, is too slow, or the song changed."""
+    if not shutil.which("yt-dlp"):
+        return None
+    try:
+        proc = subprocess.Popen(["yt-dlp", *YTDLP_FLAGS, *args], text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            out, _ = proc.communicate(timeout=0.2)
+            return out if proc.returncode == 0 else None
+        except subprocess.TimeoutExpired:
+            if not alive() or time.monotonic() > deadline:
+                proc.kill()
+                proc.communicate()
+                return None
+
+
+def match_search(entries, title, channel, length_s):
+    """(id, duration_ms) of the search result from the same channel, with the same
+    title and length (re-uploads often share a title), else None."""
+    def norm(text):
+        return " ".join((text or "").casefold().split())
+    for e in entries or []:
+        if (e.get("id") and e.get("channel") == channel and norm(e.get("title")) == norm(title)
+                and e.get("duration") is not None and abs(e["duration"] - length_s) <= 2):
+            return e["id"], round(e["duration"] * 1000)
+    return None
+
+
+def caption_url(info, kind):
+    """json3 URL of the manual captions (English first), or of the auto-generated
+    ones in the video's own language ("<lang>-orig")."""
+    tracks = info.get("subtitles" if kind == "manual" else "automatic_captions") or {}
+    names = [n for n in tracks if n != "live_chat" and (kind == "manual" or n.endswith("-orig"))]
+    names.sort(key=lambda n: not n.startswith("en"))
+    for name in names:
+        for fmt in tracks[name]:
+            if fmt.get("ext") == "json3" and fmt.get("url"):
+                return fmt["url"]
+    return None
+
+
+def recall(path, key):
+    try:
+        for line in path.read_text().splitlines():
+            k, vid, ms, at = (line.split("\t") + ["", "", "", "0"])[:4]
+            if k == key and float(at) > time.time() - VIDEO_DAYS * 86400:
+                return vid, int(ms or 0)
+    except OSError:
+        pass
+    return None
+
+
+def remember(path, key, vid, ms):
+    """Saves key -> (video id, length); rows older than VIDEO_DAYS are dropped."""
+    cutoff = time.time() - VIDEO_DAYS * 86400
+    try:
+        rows = [line for line in path.read_text().splitlines()
+                if line.split("\t")[0] != key and float((line.split("\t") + ["0"] * 4)[3]) > cutoff]
+    except OSError:
+        rows = []
+    rows.append(f"{key}\t{vid}\t{ms}\t{int(time.time())}")
+    write_atomic(path, ("\n".join(rows[-4 * MAX_VIDEOS:]) + "\n").encode())
+
+
 # ---------------------------------------------------------------- per player
 
 def spotify_song(w, p, gen, wait):
@@ -400,6 +476,105 @@ def other_song(w, p, gen, wait):
     evict(MUSIC, MAX_SONGS, keep={key})
 
 
+def browser_song(w, p, gen, wait):
+    """Browsers: the video's thumbnail and captions when it is a YouTube video we
+    can identify, else LRCLIB lyrics for the song named in the title."""
+    alive = lambda: w.alive(gen)
+    cover = fetch_art(p["art"])         # the browser's own small thumbnail, right away
+    if cover:
+        w.put(gen, "cover.jpg", cover)
+    artist, track = youtube_song(p["title"], p["artist"])
+    w.note(gen, artist=artist)
+    length_s = p["length"] / 1e6
+
+    info = {}
+    def video_info():                   # one yt-dlp call, only if something needs it
+        if not info:
+            out = ytdlp(["-J", "--skip-download", f"https://www.youtube.com/watch?v={vid}"], alive)
+            info.update(json.loads(out) if out else {"failed": True})
+        return None if "failed" in info else info
+
+    # Which video is it? From the page URL (Plasma Integration, Firefox), else search.
+    vid, expected = video_id(p["url"]), 0
+    if vid:
+        found = recall(IDS, "id:" + vid)
+        if found:
+            expected = found[1]
+        elif video_info() and video_info().get("duration"):
+            expected = round(video_info()["duration"] * 1000)
+            remember(IDS, "id:" + vid, vid, expected)
+    elif length_s >= 60:                # shorter: probably an ad, don't search
+        key = hashlib.sha1(f"{p['title']}|{p['artist']}|{round(length_s)}".encode()).hexdigest()
+        found = recall(IDS, key)
+        if found is None:
+            out = ytdlp(["--flat-playlist", "-J", f"ytsearch5:{p['title']} {p['artist']}"], alive)
+            if out is not None:
+                found = match_search(json.loads(out).get("entries"), p["title"], p["artist"], length_s) or ("", 0)
+                remember(IDS, key, *found)
+        vid, expected = found or ("", 0)
+        vid = vid or None
+
+    if vid:
+        thumb = THUMBS / f"{vid}.jpg"
+        if not thumb.exists():
+            for size in ("maxresdefault", "mqdefault"):    # both 16:9; hq/sd have black bars
+                try:
+                    write_atomic(thumb, http(f"https://i.ytimg.com/vi/{vid}/{size}.jpg"))
+                    break
+                except HttpError:
+                    continue
+        if thumb.exists():
+            thumb.touch()
+            w.put(gen, "cover.jpg", thumb.read_bytes())
+
+    # Without a video id, remember the length the lyrics were found at instead
+    song_key = vid or hashlib.sha1(f"{artist}|{track}".lower().encode()).hexdigest()
+    length_file = MUSIC / f"{song_key}.len"
+    if not expected and length_file.exists():
+        expected = int(length_file.read_text() or 0)
+    if ad_playing(p["length"], expected) or (not expected and length_s < 60):
+        w.note(gen, expected_ms=expected or "")
+        log("  looks like an ad, waiting for the video")
+        return
+    expected = expected or round(length_s * 1000)
+    w.note(gen, expected_ms=expected)
+
+    def captions(kind):
+        data = video_info()
+        if data is None:
+            return None                 # unknown, ask again next time
+        url = caption_url(data, kind)
+        return json3_to_lrc(json.loads(http(url))) if url else ""
+
+    def from_lrclib():
+        lrc, duration = lrclib(artist, track, expected / 1000, wait)
+        shift = intro_offset(expected / 1000, duration) if lrc and vid else 0
+        if shift:
+            log(f"  offset +{shift}s")
+            lrc = shift_lrc(lrc, shift)
+        return lrc
+
+    text, source = "", ""
+    sources = [(CAPTIONS / f"{vid}.lrc", lambda: captions("manual"), "captions")] if vid else []
+    sources.append((MUSIC / f"{song_key}.lrc", from_lrclib, "lrclib"))
+    if vid:
+        sources.append((CAPTIONS / f"{vid}.auto.lrc", lambda: captions("auto"), "auto-captions"))
+    for path, get, name in sources:
+        text = saved_lyrics(path, get)
+        if text:
+            source = name
+            break
+    if text:
+        if not vid:
+            write_atomic(length_file, str(expected).encode())
+        w.put(gen, "lyrics.lrc", text.encode())
+        w.note(gen, source=source)
+    log(f"  video: {vid or 'unknown'}, lyrics: {source or 'none'}")
+    for folder in (THUMBS, CAPTIONS):
+        evict(folder, 2 * MAX_VIDEOS, VIDEO_DAYS, keep={vid, f"{vid}.auto"})
+    evict(MUSIC, MAX_SONGS, keep={song_key})
+
+
 def fetch(w, p, gen):
     def wait(seconds):
         """Sleeps; False as soon as another song started."""
@@ -410,10 +585,11 @@ def fetch(w, p, gen):
             time.sleep(0.2)
         return w.alive(gen)
 
-    handler = spotify_song if is_spotify(p["name"]) else other_song
+    handler = (spotify_song if is_spotify(p["name"])
+               else browser_song if BROWSERS.search(p["name"]) else other_song)
     try:
         handler(w, p, gen, wait)
-    except (HttpError, OSError, ValueError) as e:     # ValueError covers bad JSON
+    except (HttpError, OSError, ValueError, KeyError) as e:     # ValueError covers bad JSON
         log(f"  stopped: {e}")
 
 
@@ -440,9 +616,11 @@ def status():
 def main():
     if "--status" in sys.argv:
         return status()
-    for folder in (SONGS, MUSIC):
+    for folder in (SONGS, MUSIC, THUMBS, CAPTIONS):
         folder.mkdir(parents=True, exist_ok=True)
     evict(MUSIC, MAX_SONGS)
+    for folder in (THUMBS, CAPTIONS):
+        evict(folder, 2 * MAX_VIDEOS, VIDEO_DAYS)
     w = Writer(CACHE)
     shown, seen, last_change = (), {}, {}
     # shortcut: polls playerctl once a second instead of following D-Bus signals;

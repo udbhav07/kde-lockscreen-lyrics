@@ -2,6 +2,7 @@
 
 import importlib.machinery
 import importlib.util
+import json
 import os
 import tempfile
 import time
@@ -280,6 +281,154 @@ class AdGuard(unittest.TestCase):
         self.assertTrue(mh.ad_playing(15_000_000, 232_000))
         self.assertFalse(mh.ad_playing(233_500_000, 232_000))
         self.assertFalse(mh.ad_playing(15_000_000, 0))       # unknown -> not an ad
+
+
+class Search(unittest.TestCase):
+    ENTRIES = [
+        {"id": "AAAAAAAAAAA", "title": "Ed Sheeran - Shape of You (Lyrics)", "channel": "7clouds Pop", "duration": 265},
+        {"id": "BBBBBBBBBBB", "title": "Ed Sheeran -  Shape of You (Lyrics)", "channel": "7clouds", "duration": 233},
+        {"id": "CCCCCCCCCCC", "title": "Ed Sheeran - Shape of You (Lyrics)", "channel": "7clouds", "duration": 300},
+    ]
+
+    def test_channel_title_and_duration_must_match(self):
+        self.assertEqual(mh.match_search(self.ENTRIES, "Ed Sheeran - Shape of You (Lyrics)", "7clouds", 231.4),
+                         ("BBBBBBBBBBB", 233000))
+
+    def test_no_match(self):
+        self.assertIsNone(mh.match_search(self.ENTRIES, "Ed Sheeran - Shape of You (Lyrics)", "7clouds", 15))
+        self.assertIsNone(mh.match_search([{"id": None}], "x", "y", 1))
+
+
+class CaptionTrack(unittest.TestCase):
+    INFO = {
+        "subtitles": {"live_chat": [{"ext": "json", "url": "chat"}],
+                      "hi": [{"ext": "vtt", "url": "hi.vtt"}, {"ext": "json3", "url": "hi.json3"}],
+                      "en-US": [{"ext": "json3", "url": "en.json3"}]},
+        "automatic_captions": {"fr": [{"ext": "json3", "url": "fr"}],
+                               "en-orig": [{"ext": "json3", "url": "asr.json3"}]},
+    }
+
+    def test_manual_prefers_english(self):
+        self.assertEqual(mh.caption_url(self.INFO, "manual"), "en.json3")
+
+    def test_auto_uses_original_language(self):
+        self.assertEqual(mh.caption_url(self.INFO, "auto"), "asr.json3")
+
+    def test_none(self):
+        self.assertIsNone(mh.caption_url({"subtitles": {"live_chat": []}}, "manual"))
+        self.assertIsNone(mh.caption_url({}, "auto"))
+
+
+class Remember(unittest.TestCase):
+    def test_round_trip_and_expiry(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "ids.tsv"
+            f.write_text("old\tXXXXXXXXXXX\t1000\t1\n")
+            mh.remember(f, "k", "JGwWNGJdvx8", 233000)
+            self.assertEqual(mh.recall(f, "k"), ("JGwWNGJdvx8", 233000))
+            self.assertIsNone(mh.recall(f, "old"))
+            self.assertNotIn("old", f.read_text())
+
+
+class BrowserSong(unittest.TestCase):
+    """The YouTube handler with network and yt-dlp replaced by fakes."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.saved = {k: getattr(mh, k) for k in ("CACHE", "MUSIC", "YT", "THUMBS", "CAPTIONS", "IDS",
+                                                  "http", "ytdlp", "lrclib")}
+        mh.CACHE, mh.MUSIC, mh.YT = root, root / "youtube-music", root / "youtube"
+        mh.THUMBS, mh.CAPTIONS, mh.IDS = mh.YT / "thumbs", mh.YT / "captions", mh.YT / "ids.tsv"
+        for folder in (mh.MUSIC, mh.THUMBS, mh.CAPTIONS):
+            folder.mkdir(parents=True)
+        self.calls = []
+        self.info = {"duration": 233, "subtitles": {}, "automatic_captions": {}}
+        self.lrclib_answer = ("[00:01.00]from lrclib", 233)
+        mh.ytdlp = self.fake_ytdlp
+        mh.http = self.fake_http
+        mh.lrclib = lambda artist, track, length_s, wait: (self.calls.append(("lrclib", artist, track))
+                                                           or self.lrclib_answer)
+        self.w = mh.Writer(root)
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(mh, k, v)
+        self.tmp.cleanup()
+
+    def fake_ytdlp(self, args, alive):
+        self.calls.append(("ytdlp", args[-1]))
+        return json.dumps(self.info)
+
+    def fake_http(self, url):
+        self.calls.append(("http", url))
+        if url.endswith("maxresdefault.jpg"):
+            raise mh.HttpError(404)
+        if url.endswith(".json3"):
+            return json.dumps({"events": [{"tStartMs": 1000, "dDurationMs": 1, "segs": [{"utf8": "caption"}]}]}).encode()
+        return b"JPEG"
+
+    def play(self, length=233_000_000, url="https://www.youtube.com/watch?v=JGwWNGJdvx8"):
+        p = player("plasma-browser-integration", title="Ed Sheeran - Shape of You (Official Video)",
+                   artist="Ed Sheeran", length=length, url=url)
+        gen = self.w.switch(p)
+        mh.browser_song(self.w, p, gen, lambda s: True)
+        return (self.w.folder / "now.txt").read_text().rstrip("\n").split("\t")
+
+    def lyrics(self):
+        f = self.w.folder / "lyrics.lrc"
+        return f.read_text() if f.exists() else ""
+
+    def test_manual_captions_win(self):
+        self.info["subtitles"] = {"en": [{"ext": "json3", "url": "https://c/en.json3"}]}
+        now = self.play()
+        self.assertEqual(self.lyrics(), "[00:01.00]caption")
+        self.assertEqual(now[2:], ["Ed Sheeran", "captions", "233000"])
+        self.assertEqual((self.w.folder / "cover.jpg").read_bytes(), b"JPEG")
+        self.assertIn(("http", "https://i.ytimg.com/vi/JGwWNGJdvx8/mqdefault.jpg"), self.calls)
+
+    def test_lrclib_before_auto_captions(self):
+        self.info["automatic_captions"] = {"en-orig": [{"ext": "json3", "url": "https://c/a.json3"}]}
+        now = self.play()
+        self.assertEqual(self.lyrics(), "[00:01.00]from lrclib")
+        self.assertEqual(now[3], "lrclib")
+        self.assertIn(("lrclib", "Ed Sheeran", "Shape of You"), self.calls)
+
+    def test_auto_captions_last(self):
+        self.info["automatic_captions"] = {"en-orig": [{"ext": "json3", "url": "https://c/a.json3"}]}
+        self.lrclib_answer = ("", None)
+        self.assertEqual(self.play()[3], "auto-captions")
+
+    def test_intro_offset_applied_to_lrclib(self):
+        self.lrclib_answer = ("[00:01.00]from lrclib", 220)
+        self.play()
+        self.assertEqual(self.lyrics(), "[00:14.00]from lrclib")
+
+    def test_second_play_needs_no_network(self):
+        self.play()
+        self.calls.clear()
+        self.play()
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.lyrics(), "[00:01.00]from lrclib")
+
+    def test_ad_hides_lyrics_and_caches_nothing(self):
+        self.play()                         # learn the real length
+        now = self.play(length=15_000_000)  # same title, ad length
+        self.assertEqual(self.lyrics(), "")
+        self.assertEqual(now[4], "233000")
+
+    def test_first_play_starting_with_ad(self):
+        now = self.play(length=15_000_000, url="")
+        self.assertEqual(self.lyrics(), "")
+        self.assertEqual(list(mh.MUSIC.iterdir()), [])
+        self.assertEqual(now[3:], ["", ""])
+
+    def test_without_url_searches_by_title_and_channel(self):
+        self.info = {"entries": [{"id": "JGwWNGJdvx8", "title": "Ed Sheeran - Shape of You (Official Video)",
+                                  "channel": "Ed Sheeran", "duration": 233}]}
+        now = self.play(url="")
+        self.assertEqual(self.calls[0], ("ytdlp", "ytsearch5:Ed Sheeran - Shape of You (Official Video) Ed Sheeran"))
+        self.assertEqual(now[4], "233000")
 
 
 if __name__ == "__main__":
