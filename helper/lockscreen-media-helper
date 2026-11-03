@@ -611,6 +611,13 @@ def status():
     for name in ("cover.jpg", "lyrics.lrc"):
         f = CACHE / name
         log(f"file    {name}: {f'{f.stat().st_size} bytes' if f.exists() else 'missing'}")
+    if current and BROWSERS.search(current["name"]):
+        log(f"video   {video_id(current['url']) or 'no URL from the browser, found by searching'}")
+    pbi = any(p["name"].startswith("plasma-browser-integration") for p in players)
+    for tool, ok, fix in (("yt-dlp", shutil.which("yt-dlp"), "sudo dnf install yt-dlp"),
+                          ("node", shutil.which("node"), "sudo dnf install nodejs22"),
+                          ("Plasma Integration", pbi, "browser extension, gives exact YouTube videos")):
+        log(f"check   {tool}: {'ok' if ok else 'missing - ' + fix}")
 
 
 def main():
