@@ -331,6 +331,7 @@ Item {
             anchors.bottomMargin: nowPlaying.height + Kirigami.Units.gridUnit * 5
             width: Math.min(parent.width * 0.5, Kirigami.Units.gridUnit * 44)
             lyricsText: nowPlaying.lyricsText
+            source: nowPlaying.lyricsSource
             positionMs: nowPlaying.positionMs
             shown: nowPlaying.visible && nowPlaying.lyricsShown && !lockScreenRoot.uiVisible
         }

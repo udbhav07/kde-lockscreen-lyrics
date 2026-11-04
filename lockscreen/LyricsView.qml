@@ -20,6 +20,7 @@ Item {
     property string lyricsText: ""     // LRC text from MediaFiles
     property real positionMs: 0        // song position from NowPlaying
     property bool shown: true
+    property string source: ""         // "captions" / "auto-captions" / "lrclib", from now.txt
 
     // Where the current line sits, as a fraction of the height
     readonly property real focusRatio: 0.33
@@ -230,6 +231,20 @@ Item {
                 }
             }
         }
+    }
+
+    // Only the unusual sources get a label; LRCLIB is the normal case
+    Text {
+        anchors.left: parent.left
+        anchors.bottom: parent.bottom
+        visible: text !== ""
+        text: root.source === "captions" ? "From captions"
+            : root.source === "auto-captions" ? "Auto-generated captions" : ""
+        textFormat: Text.PlainText
+        color: "white"
+        opacity: 0.55
+        font.family: "Red Hat Display"
+        font.pointSize: Kirigami.Theme.smallFont.pointSize
     }
 
     // Mask for the fade: opaque in the middle, transparent at the edges
