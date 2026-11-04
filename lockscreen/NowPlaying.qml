@@ -50,7 +50,12 @@ Rectangle {
     // turns tabs and newlines in titles into spaces; do the same here.
     readonly property bool owned: files !== null && player !== null
         && (!files.ownerKnown || files.ownerTitle === player.track.replace(/[\t\r\n]/g, " "))
-    readonly property string lyricsText: owned ? files.lyricsText : ""
+    // During a YouTube ad the browser keeps the video's title but reports the
+    // ad's length: hide the lyrics, they would scroll with the ad.
+    readonly property bool adPlaying: owned && files.expectedMs > 0
+        && Math.abs(lengthMs - files.expectedMs) > 2000
+    readonly property string lyricsText: owned && !adPlaying ? files.lyricsText : ""
+    readonly property string lyricsSource: owned ? files.lyricsSource : ""
     readonly property string coverUrl: owned ? files.coverUrl : ""
     readonly property bool hasLyrics: lyricsText.length > 0
     readonly property color accent: "#C3C6FB"
@@ -237,8 +242,7 @@ Rectangle {
             Layout.preferredWidth: Kirigami.Units.gridUnit * 4.4
             Layout.preferredHeight: Layout.preferredWidth
 
-            Kirigami.ShadowedImage {
-                id: cover
+            component Cover: Kirigami.ShadowedImage {
                 anchors.fill: parent
                 radius: Kirigami.Units.gridUnit * 0.6
                 color: Qt.rgba(1, 1, 1, 0.08)
@@ -249,14 +253,36 @@ Rectangle {
                 asynchronous: true
                 sourceSize.width: width * Screen.devicePixelRatio
                 sourceSize.height: height * Screen.devicePixelRatio
+            }
+
+            // The old cover stays underneath while the new one fades in on top,
+            // e.g. the browser's blurry thumbnail -> the video's HD one.
+            Cover {
+                id: previousCover
+            }
+            Cover {
+                id: cover
                 source: root.coverUrl
+                onSourceChanged: {
+                    fadeIn.stop();
+                    if (String(source) === "") {
+                        previousCover.source = "";   // no cover now: never keep the old one
+                    }
+                }
+                onStatusChanged: if (status === Image.Ready) fadeIn.restart()
+                NumberAnimation on opacity {
+                    id: fadeIn
+                    from: 0; to: 1; duration: 300; easing.type: Easing.OutCubic
+                    running: false
+                    onFinished: previousCover.source = cover.source
+                }
             }
 
             Kirigami.Icon {
                 anchors.centerIn: parent
                 width: parent.width / 2
                 height: width
-                visible: cover.status !== Image.Ready
+                visible: cover.status !== Image.Ready && previousCover.status !== Image.Ready
                 source: "media-album-cover-manager-amarok-symbolic"
                 isMask: true
                 color: root.accent
@@ -318,7 +344,9 @@ Rectangle {
             PlasmaComponents3.Label {
                 Layout.fillWidth: true
                 horizontalAlignment: Text.AlignHCenter
-                text: root.player ? (root.player.artist || root.player.identity) : ""
+                // The artist read from a YouTube title beats the channel name
+                text: root.owned && root.files.ownerArtist ? root.files.ownerArtist
+                    : root.player ? (root.player.artist || root.player.identity) : ""
                 textFormat: Text.PlainText
                 elide: Text.ElideRight
                 maximumLineCount: 1
