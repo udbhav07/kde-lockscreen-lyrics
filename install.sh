@@ -25,5 +25,11 @@ systemctl --user enable lockscreen-lyrics-prefetch
 # Does nothing until you've run: lockscreen-lyrics-prefetch --login
 systemctl --user restart lockscreen-lyrics-prefetch
 
+# Optional: YouTube thumbnails and captions need yt-dlp (+ node for its YouTube solver)
+for tool in yt-dlp node; do
+    command -v "$tool" >/dev/null || echo "Note: $tool not found; YouTube gets LRCLIB lyrics only (sudo dnf install yt-dlp nodejs22)."
+done
+
 echo "Done. Test it with: /usr/libexec/kscreenlocker_greet --testing"
+echo "See what the helper sees: lockscreen-media-helper --status"
 
