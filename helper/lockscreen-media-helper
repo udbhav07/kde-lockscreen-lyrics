@@ -527,11 +527,9 @@ def browser_song(w, p, gen, wait):
             thumb.touch()
             w.put(gen, "cover.jpg", thumb.read_bytes())
 
-    # Without a video id, remember the length the lyrics were found at instead
+    # Without a video id there is no real length to compare: then anything
+    # under a minute counts as an ad (different videos of one song differ in length)
     song_key = vid or hashlib.sha1(f"{artist}|{track}".lower().encode()).hexdigest()
-    length_file = MUSIC / f"{song_key}.len"
-    if not expected and length_file.exists():
-        expected = int(length_file.read_text() or 0)
     if ad_playing(p["length"], expected) or (not expected and length_s < 60):
         w.note(gen, expected_ms=expected or "")
         log("  looks like an ad, waiting for the video")
@@ -565,8 +563,6 @@ def browser_song(w, p, gen, wait):
             source = name
             break
     if text:
-        if not vid:
-            write_atomic(length_file, str(expected).encode())
         w.put(gen, "lyrics.lrc", text.encode())
         w.note(gen, source=source)
     log(f"  video: {vid or 'unknown'}, lyrics: {source or 'none'}")
