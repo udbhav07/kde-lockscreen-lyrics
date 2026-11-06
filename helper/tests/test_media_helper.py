@@ -423,6 +423,28 @@ class BrowserSong(unittest.TestCase):
         self.assertEqual(list(mh.MUSIC.iterdir()), [])
         self.assertEqual(now[3:], ["", ""])
 
+    def test_caption_download_failure_falls_through_to_lrclib(self):
+        self.info["subtitles"] = {"en": [{"ext": "json3", "url": "https://c/blocked"}]}
+        real = self.fake_http
+        def blocked(url):
+            if url.endswith("blocked"):
+                raise mh.HttpError(403)
+            return real(url)
+        mh.http = blocked
+        self.assertEqual(self.play()[3], "lrclib")
+        self.assertFalse((mh.CAPTIONS / "JGwWNGJdvx8.lrc").exists())    # retried next time
+
+    def test_two_videos_of_one_song_both_show_lyrics(self):
+        self.play(length=250_000_000, url="")       # no video id: official video
+        self.assertEqual(self.lyrics(), "[00:01.00]from lrclib")
+        self.play(length=210_000_000, url="")       # lyric video, same song, other length
+        self.assertEqual(self.lyrics(), "[00:01.00]from lrclib")
+
+    def test_long_ad_first_does_not_hide_the_video_later(self):
+        self.play(length=70_000_000, url="")        # 70 s ad, taken as the video
+        self.play(length=233_000_000, url="")
+        self.assertEqual(self.lyrics(), "[00:01.00]from lrclib")
+
     def test_without_url_searches_by_title_and_channel(self):
         self.info = {"entries": [{"id": "JGwWNGJdvx8", "title": "Ed Sheeran - Shape of You (Official Video)",
                                   "channel": "Ed Sheeran", "duration": 233}]}

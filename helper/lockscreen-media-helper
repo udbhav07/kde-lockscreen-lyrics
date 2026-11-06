@@ -542,7 +542,13 @@ def browser_song(w, p, gen, wait):
         if data is None:
             return None                 # unknown, ask again next time
         url = caption_url(data, kind)
-        return json3_to_lrc(json.loads(http(url))) if url else ""
+        if not url:
+            return ""
+        try:
+            return json3_to_lrc(json.loads(http(url)))
+        except HttpError as e:          # e.g. 403 when YouTube wants a token: try the next source
+            log(f"  {kind} captions: {e}")
+            return None
 
     def from_lrclib():
         lrc, duration = lrclib(artist, track, expected / 1000, wait)
