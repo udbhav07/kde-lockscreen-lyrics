@@ -26,6 +26,10 @@ class PickPlayer(unittest.TestCase):
         players = [player("spotify", "Paused"), player("brave.instance5", "Playing")]
         self.assertEqual(mh.pick(players, {})["name"], "brave.instance5")
 
+    def test_last_used_wins_when_all_paused(self):
+        players = [player("spotify", "Paused"), player("brave.instance5", "Paused")]
+        self.assertEqual(mh.pick(players, {"spotify": 1, "brave.instance5": 2})["name"], "brave.instance5")
+
     def test_spotify_wins_tie(self):
         players = [player("brave.instance5"), player("spotify")]
         self.assertEqual(mh.pick(players, {})["name"], "spotify")

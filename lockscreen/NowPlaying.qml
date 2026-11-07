@@ -23,9 +23,10 @@ Rectangle {
     property bool lyricsShown: true
     signal lyricsButtonClicked()
 
-    // Same order as lockscreen-media-helper: a player that is playing, then
-    // Spotify, then KDE's own choice. Picking differently from the helper only
-    // hides the cover and lyrics (see `owned`), it never shows the wrong ones.
+    // Same order as lockscreen-media-helper: a player that is playing (Spotify
+    // first if several are), else KDE's own choice, which is the one used last.
+    // Picking differently from the helper only hides the cover and lyrics (see
+    // `owned`), it never shows the wrong ones.
     readonly property var player: {
         let best = null;
         let bestScore = -1;
@@ -34,7 +35,7 @@ Rectangle {
             if (!p || !p.container || p.track.length === 0) {
                 continue;
             }
-            const score = (p.playing ? 4 : 0) + (p.isSpotify ? 2 : 0)
+            const score = (p.playing ? 4 : 0) + (p.playing && p.isSpotify ? 2 : 0)
                 + (p.container === mpris.currentPlayer ? 1 : 0);
             if (score > bestScore) {
                 best = p.container;

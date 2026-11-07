@@ -30,7 +30,7 @@ Any player ──MPRIS/D-Bus──► lockscreen-media-helper ──► ~/.cache
 ```
 
 - **The lock screen can't use the internet**, so two background services (systemd user units) download everything into `~/.cache` and the lock screen only reads files.
-- **`helper/lockscreen-media-helper`** (Python): asks `playerctl` every second which players exist and picks the one to show (playing first, then Spotify). On every song change it clears the old files, writes `now.txt`, then fills `cover.jpg` and `lyrics.lrc` in the background:
+- **`helper/lockscreen-media-helper`** (Python): asks `playerctl` every second which players exist and picks the one to show (a playing one, Spotify first if several are; else the one used last). On every song change it clears the old files, writes `now.txt`, then fills `cover.jpg` and `lyrics.lrc` in the background:
   - **Spotify**: cover and [LRCLIB](https://lrclib.net) lyrics, saved in `songs/`.
   - **Browsers**: the browser's thumbnail right away; for YouTube the HD thumbnail and lyrics from, in order, the video's own captions, LRCLIB, auto-generated captions. Videos with an intro get LRCLIB lyrics shifted to match. During an ad (same title, different length) lyrics stay hidden.
   - **Other players**: their cover and LRCLIB lyrics.

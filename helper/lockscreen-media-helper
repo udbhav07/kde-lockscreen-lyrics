@@ -106,12 +106,13 @@ def is_spotify(name):
 
 
 def pick(players, last_change):
-    """The player to show: has a title, then playing, then Spotify, then most recently changed.
-    The lock screen (NowPlaying.qml) uses the same order."""
+    """The player to show: one that is playing (Spotify first if several are),
+    else the one used last. The lock screen (NowPlaying.qml) uses the same order."""
     candidates = [p for p in players if p["title"]]
     if not candidates:
         return None
-    return max(candidates, key=lambda p: (p["status"] == "Playing", is_spotify(p["name"]),
+    return max(candidates, key=lambda p: (p["status"] == "Playing",
+                                          p["status"] == "Playing" and is_spotify(p["name"]),
                                           last_change.get(p["name"], 0)))
 
 
